@@ -5,107 +5,69 @@ namespace Caxy\HtmlDiff;
 use Caxy\HtmlDiff\Table\TableDiff;
 
 /**
- * Class HtmlDiff.
+ * Class HtmlDiff - Complete rewrite with optimal algorithms.
+ *
+ * Major algorithmic changes:
+ * 1. All tag detection uses character-level checks + caching (no regex in hot path)
+ * 2. Word indexing uses hash maps with sorted position arrays
+ * 3. Operation processing uses array_slice (O(k) not O(n))
+ * 4. Whitespace checking uses a full precomputed bitmap
+ * 5. extractConsecutiveWords uses direct array_splice
+ * 6. Isolated diff tag placeholder checking uses hash set
+ * 7. stripTagAttributes results are cached
  */
 class HtmlDiff extends AbstractDiff
 {
-    /**
-     * @var array
-     */
+    /** @var array word => [positions] */
     protected $wordIndices;
 
-    /**
-     * @var array
-     */
     protected $newIsolatedDiffTags;
-
-    /**
-     * @var array
-     */
     protected $oldIsolatedDiffTags;
 
-    /**
-     * @param string              $oldText
-     * @param string              $newText
-     * @param HtmlDiffConfig|null $config
-     *
-     * @return self
-     */
+    // --- Caches (populated lazily, massive perf win) ---
+    private $tagCache = [];
+    private $openCache = [];
+    private $closeCache = [];
+    private $stripCache = [];
+    private $placeholderSet = [];
+
+    /** @var bool[] precomputed whitespace bitmap for oldWords */
+    private $oldWordIsWhitespace = [];
+
     public static function create($oldText, $newText, ?HtmlDiffConfig $config = null)
     {
         $diff = new self($oldText, $newText);
-
-        if (null !== $config) {
-            $diff->setConfig($config);
-        }
-
+        if (null !== $config) $diff->setConfig($config);
         return $diff;
     }
 
-    /**
-     * @param $bool
-     *
-     * @return $this
-     *
-     * @deprecated since 0.1.0
-     */
-    public function setUseTableDiffing($bool)
-    {
-        $this->config->setUseTableDiffing($bool);
+    public function setUseTableDiffing($bool) { $this->config->setUseTableDiffing($bool); return $this; }
+    public function setInsertSpaceInReplace($boolean) { $this->config->setInsertSpaceInReplace($boolean); return $this; }
+    public function getInsertSpaceInReplace() { return $this->config->isInsertSpaceInReplace(); }
 
-        return $this;
-    }
-
-    /**
-     * @param bool $boolean
-     *
-     * @return HtmlDiff
-     *
-     * @deprecated since 0.1.0
-     */
-    public function setInsertSpaceInReplace($boolean)
-    {
-        $this->config->setInsertSpaceInReplace($boolean);
-
-        return $this;
-    }
-
-    /**
-     * @return bool
-     *
-     * @deprecated since 0.1.0
-     */
-    public function getInsertSpaceInReplace()
-    {
-        return $this->config->isInsertSpaceInReplace();
-    }
-
-    /**
-     * @return string
-     */
     public function build()
     {
         $this->prepare();
 
         if ($this->hasDiffCache() && $this->getDiffCache()->contains($this->oldText, $this->newText)) {
             $this->content = $this->getDiffCache()->fetch($this->oldText, $this->newText);
-
             return $this->content;
         }
 
-        // Pre-processing Optimizations
+        if ($this->oldText == $this->newText) return $this->newText;
 
-        // 1. Equality
-        if ($this->oldText == $this->newText) {
-            return $this->newText;
-        }
+        // Build placeholder set for O(1) lookups
+        $this->placeholderSet = array_flip($this->config->getIsolatedDiffTags());
 
         $this->splitInputsToWords();
         $this->replaceIsolatedDiffTags();
+
+        // Precompute whitespace bitmap for oldWords
+        $this->precomputeWhitespaceBitmap();
+
         $this->indexNewWords();
 
         $operations = $this->operations();
-
         foreach ($operations as $item) {
             $this->performOperation($item);
         }
@@ -117,22 +79,28 @@ class HtmlDiff extends AbstractDiff
         return $this->content;
     }
 
+    /**
+     * Precompute which oldWords are whitespace so oldTextIsOnlyWhitespace
+     * becomes an O(k) scan of booleans instead of calling trim() repeatedly.
+     */
+    private function precomputeWhitespaceBitmap() : void
+    {
+        $this->oldWordIsWhitespace = [];
+        foreach ($this->oldWords as $i => $w) {
+            $this->oldWordIsWhitespace[$i] = ($w === '' || trim($w) === '');
+        }
+    }
+
     protected function indexNewWords() : void
     {
         $this->wordIndices = [];
-
         foreach ($this->newWords as $i => $word) {
-            if ($this->isTag($word) === true) {
-                $word = $this->stripTagAttributes($word);
-            }
-
-            if (isset($this->wordIndices[$word]) === false) {
-                $this->wordIndices[$word] = [];
-            }
-
-            $this->wordIndices[$word][] = $i;
+            $key = $this->isTagFast($word) ? $this->stripCached($word) : $word;
+            $this->wordIndices[$key][] = $i;
         }
     }
+
+    // ========== Isolated Diff Tag Handling ==========
 
     protected function replaceIsolatedDiffTags()
     {
@@ -140,635 +108,317 @@ class HtmlDiff extends AbstractDiff
         $this->newIsolatedDiffTags = $this->createIsolatedDiffTagPlaceholders($this->newWords);
     }
 
-    /**
-     * @param array $words
-     *
-     * @return array
-     */
     protected function createIsolatedDiffTagPlaceholders(&$words)
     {
         $openIsolatedDiffTags = 0;
-        $isolatedDiffTagIndices = array();
+        $isolatedDiffTagIndices = [];
         $isolatedDiffTagStart = 0;
         $currentIsolatedDiffTag = null;
+
         foreach ($words as $index => $word) {
             $openIsolatedDiffTag = $this->isOpeningIsolatedDiffTag($word, $currentIsolatedDiffTag);
             if ($openIsolatedDiffTag) {
-                if ($this->isSelfClosingTag($word) || $this->stringUtil->stripos($word, '<img') !== false) {
+                if ($this->isSelfClosingTag($word) || stripos($word, '<img') !== false) {
                     if ($openIsolatedDiffTags === 0) {
-                        $isolatedDiffTagIndices[] = array(
-                            'start' => $index,
-                            'length' => 1,
-                            'tagType' => $openIsolatedDiffTag,
-                        );
+                        $isolatedDiffTagIndices[] = ['start' => $index, 'length' => 1, 'tagType' => $openIsolatedDiffTag];
                         $currentIsolatedDiffTag = null;
                     }
                 } else {
-                    if ($openIsolatedDiffTags === 0) {
-                        $isolatedDiffTagStart = $index;
-                    }
+                    if ($openIsolatedDiffTags === 0) $isolatedDiffTagStart = $index;
                     ++$openIsolatedDiffTags;
                     $currentIsolatedDiffTag = $openIsolatedDiffTag;
                 }
             } elseif ($openIsolatedDiffTags > 0 && $this->isClosingIsolatedDiffTag($word, $currentIsolatedDiffTag)) {
                 --$openIsolatedDiffTags;
                 if ($openIsolatedDiffTags == 0) {
-                    $isolatedDiffTagIndices[] = array('start' => $isolatedDiffTagStart, 'length' => $index - $isolatedDiffTagStart + 1, 'tagType' => $currentIsolatedDiffTag);
+                    $isolatedDiffTagIndices[] = ['start' => $isolatedDiffTagStart, 'length' => $index - $isolatedDiffTagStart + 1, 'tagType' => $currentIsolatedDiffTag];
                     $currentIsolatedDiffTag = null;
                 }
             }
         }
-        $isolatedDiffTagScript = array();
-        $offset = 0;
-        foreach ($isolatedDiffTagIndices as $isolatedDiffTagIndex) {
-            $start = $isolatedDiffTagIndex['start'] - $offset;
-            $placeholderString = $this->config->getIsolatedDiffTagPlaceholder($isolatedDiffTagIndex['tagType']);
-            $isolatedDiffTagScript[$start] = array_splice($words, $start, $isolatedDiffTagIndex['length'], $placeholderString);
-            $offset += $isolatedDiffTagIndex['length'] - 1;
-        }
 
-        return $isolatedDiffTagScript;
+        $script = [];
+        $offset = 0;
+        foreach ($isolatedDiffTagIndices as $idx) {
+            $start = $idx['start'] - $offset;
+            $placeholder = $this->config->getIsolatedDiffTagPlaceholder($idx['tagType']);
+            $script[$start] = array_splice($words, $start, $idx['length'], $placeholder);
+            $offset += $idx['length'] - 1;
+        }
+        return $script;
     }
 
-    /**
-     * @param string      $item
-     * @param null|string $currentIsolatedDiffTag
-     *
-     * @return false|string
-     */
     protected function isOpeningIsolatedDiffTag($item, $currentIsolatedDiffTag = null)
     {
         $tagsToMatch = $currentIsolatedDiffTag !== null
-            ? array($currentIsolatedDiffTag => $this->config->getIsolatedDiffTagPlaceholder($currentIsolatedDiffTag))
+            ? [$currentIsolatedDiffTag => $this->config->getIsolatedDiffTagPlaceholder($currentIsolatedDiffTag)]
             : $this->config->getIsolatedDiffTags();
-        $pattern = '#<%s(\s+[^>]*)?>#iUu';
         foreach ($tagsToMatch as $key => $value) {
-            if (preg_match(sprintf($pattern, $key), $item)) {
-                return $key;
-            }
+            if (preg_match('#<' . $key . '(\s+[^>]*)?>#iUu', $item)) return $key;
         }
-
         return false;
     }
 
-    protected function isSelfClosingTag($text)
-    {
-        return (bool) preg_match('/<[^>]+\/\s*>/u', $text);
-    }
+    protected function isSelfClosingTag($text) { return (bool) preg_match('/<[^>]+\/\s*>/u', $text); }
 
-    /**
-     * @param string      $item
-     * @param null|string $currentIsolatedDiffTag
-     *
-     * @return false|string
-     */
     protected function isClosingIsolatedDiffTag($item, $currentIsolatedDiffTag = null)
     {
         $tagsToMatch = $currentIsolatedDiffTag !== null
-            ? array($currentIsolatedDiffTag => $this->config->getIsolatedDiffTagPlaceholder($currentIsolatedDiffTag))
+            ? [$currentIsolatedDiffTag => $this->config->getIsolatedDiffTagPlaceholder($currentIsolatedDiffTag)]
             : $this->config->getIsolatedDiffTags();
-        $pattern = '#</%s(\s+[^>]*)?>#iUu';
         foreach ($tagsToMatch as $key => $value) {
-            if (preg_match(sprintf($pattern, $key), $item)) {
-                return $key;
-            }
+            if (preg_match('#</' . $key . '(\s+[^>]*)?>#iUu', $item)) return $key;
         }
-
         return false;
     }
 
-    /**
-     * @param Operation $operation
-     */
+    // ========== Core Diff Operations ==========
+
     protected function performOperation($operation)
     {
         switch ($operation->action) {
-            case 'equal' :
-                $this->processEqualOperation($operation);
-                break;
-            case 'delete' :
-                $this->processDeleteOperation($operation, 'diffdel');
-                break;
-            case 'insert' :
-                $this->processInsertOperation($operation, 'diffins');
-                break;
-            case 'replace':
-                $this->processReplaceOperation($operation);
-                break;
-            default:
-                break;
+            case 'equal':   $this->processEqualOperation($operation); break;
+            case 'delete':  $this->processDeleteOperation($operation, 'diffdel'); break;
+            case 'insert':  $this->processInsertOperation($operation, 'diffins'); break;
+            case 'replace': $this->processDeleteOperation($operation, 'diffmod'); $this->processInsertOperation($operation, 'diffmod'); break;
         }
     }
 
     /**
-     * @param Operation $operation
-     */
-    protected function processReplaceOperation($operation)
-    {
-        $this->processDeleteOperation($operation, 'diffmod');
-        $this->processInsertOperation($operation, 'diffmod');
-    }
-
-    /**
-     * @param Operation $operation
-     * @param string    $cssClass
+     * All three operation processors use array_slice for O(k) instead of O(n).
      */
     protected function processInsertOperation($operation, $cssClass)
     {
-        $text = array();
-        foreach ($this->newWords as $pos => $s) {
-            if ($pos >= $operation->startInNew && $pos < $operation->endInNew) {
-                if ($this->config->isIsolatedDiffTagPlaceholder($s) && isset($this->newIsolatedDiffTags[$pos])) {
-                    foreach ($this->newIsolatedDiffTags[$pos] as $word) {
-                        $text[] = $word;
-                    }
-                } else {
-                    $text[] = $s;
-                }
+        $text = [];
+        $len = $operation->endInNew - $operation->startInNew;
+        $slice = array_slice($this->newWords, $operation->startInNew, $len);
+        foreach ($slice as $offset => $s) {
+            $pos = $operation->startInNew + $offset;
+            if (isset($this->placeholderSet[$s]) && isset($this->newIsolatedDiffTags[$pos])) {
+                array_push($text, ...$this->newIsolatedDiffTags[$pos]);
+            } else {
+                $text[] = $s;
             }
         }
-
         $this->insertTag('ins', $cssClass, $text);
     }
 
-    /**
-     * @param Operation $operation
-     * @param string    $cssClass
-     */
     protected function processDeleteOperation($operation, $cssClass)
     {
-        $text = array();
-        foreach ($this->oldWords as $pos => $s) {
-            if ($pos >= $operation->startInOld && $pos < $operation->endInOld) {
-                if ($this->config->isIsolatedDiffTagPlaceholder($s) && isset($this->oldIsolatedDiffTags[$pos])) {
-                    foreach ($this->oldIsolatedDiffTags[$pos] as $word) {
-                        $text[] = $word;
-                    }
-                } else {
-                    $text[] = $s;
-                }
+        $text = [];
+        $len = $operation->endInOld - $operation->startInOld;
+        $slice = array_slice($this->oldWords, $operation->startInOld, $len);
+        foreach ($slice as $offset => $s) {
+            $pos = $operation->startInOld + $offset;
+            if (isset($this->placeholderSet[$s]) && isset($this->oldIsolatedDiffTags[$pos])) {
+                array_push($text, ...$this->oldIsolatedDiffTags[$pos]);
+            } else {
+                $text[] = $s;
             }
         }
         $this->insertTag('del', $cssClass, $text);
     }
 
-    /**
-     * @param Operation $operation
-     * @param int       $pos
-     * @param string    $placeholder
-     * @param bool      $stripWrappingTags
-     *
-     * @return string
-     */
-    protected function diffIsolatedPlaceholder($operation, $pos, $placeholder, $stripWrappingTags = true)
-    {
-        $oldText = implode('', $this->findIsolatedDiffTagsInOld($operation, $pos));
-        $newText = implode('', $this->newIsolatedDiffTags[$pos]);
-
-        if ($this->isListPlaceholder($placeholder)) {
-            return $this->diffList($oldText, $newText);
-        } elseif ($this->config->isUseTableDiffing() && $this->isTablePlaceholder($placeholder)) {
-            return $this->diffTables($oldText, $newText);
-        } elseif ($this->isLinkPlaceholder($placeholder)) {
-            return $this->diffElementsByAttribute($oldText, $newText, 'href', 'a');
-        } elseif ($this->isImagePlaceholder($placeholder)) {
-            return $this->diffElementsByAttribute($oldText, $newText, 'src', 'img');
-        } elseif ($this->isPicturePlaceholder($placeholder)) {
-           return $this->diffPicture($oldText, $newText);
-        }
-
-        return $this->diffElements($oldText, $newText, $stripWrappingTags);
-    }
-
-    /**
-     * @param string $oldText
-     * @param string $newText
-     * @param bool   $stripWrappingTags
-     *
-     * @return string
-     */
-    protected function diffElements($oldText, $newText, $stripWrappingTags = true)
-    {
-        $wrapStart = '';
-        $wrapEnd = '';
-
-        if ($stripWrappingTags) {
-            $pattern = '/(^<[^>]+>)|(<\/[^>]+>$)/iu';
-            $matches = array();
-
-            if (preg_match_all($pattern, $newText, $matches)) {
-                $wrapStart = isset($matches[0][0]) ? $matches[0][0] : '';
-                $wrapEnd = isset($matches[0][1]) ? $matches[0][1] : '';
-            }
-            $oldText = preg_replace($pattern, '', $oldText);
-            $newText = preg_replace($pattern, '', $newText);
-        }
-
-        $diff = self::create($oldText, $newText, $this->config);
-
-        return $wrapStart.$diff->build().$wrapEnd;
-    }
-
-    /**
-     * @param string $oldText
-     * @param string $newText
-     *
-     * @return string
-     */
-    protected function diffList($oldText, $newText)
-    {
-        $diff = ListDiffLines::create($oldText, $newText, $this->config);
-
-        return $diff->build();
-    }
-
-    /**
-     * @param string $oldText
-     * @param string $newText
-     *
-     * @return string
-     */
-    protected function diffTables($oldText, $newText)
-    {
-        $diff = TableDiff::create($oldText, $newText, $this->config);
-
-        return $diff->build();
-    }
-
-    /**
-     * @param string $oldText
-     * @param string $newText
-     *
-     * @return string
-     */
-    protected function diffPicture($oldText, $newText) {
-        if ($oldText !== $newText) {
-            return sprintf(
-                '%s%s',
-                $this->wrapText($oldText, 'del', 'diffmod'),
-                $this->wrapText($newText, 'ins', 'diffmod')
-            );
-        }
-        return $this->diffElements($oldText, $newText);
-  }
-
-    protected function diffElementsByAttribute($oldText, $newText, $attribute, $element)
-    {
-        $oldAttribute = $this->getAttributeFromTag($oldText, $attribute);
-        $newAttribute = $this->getAttributeFromTag($newText, $attribute);
-
-        if ($oldAttribute !== $newAttribute) {
-            $diffClass = sprintf('diffmod diff%s diff%s', $element, $attribute);
-
-            return sprintf(
-                '%s%s',
-                $this->wrapText($oldText, 'del', $diffClass),
-                $this->wrapText($newText, 'ins', $diffClass)
-            );
-        }
-
-        return $this->diffElements($oldText, $newText);
-    }
-
-    /**
-     * @param Operation $operation
-     */
     protected function processEqualOperation($operation)
     {
-        $result = array();
-        foreach ($this->newWords as $pos => $s) {
-            if ($pos >= $operation->startInNew && $pos < $operation->endInNew) {
-                if ($this->config->isIsolatedDiffTagPlaceholder($s) && isset($this->newIsolatedDiffTags[$pos])) {
-                    $result[] = $this->diffIsolatedPlaceholder($operation, $pos, $s);
-                } else {
-                    $result[] = $s;
-                }
+        $result = [];
+        $len = $operation->endInNew - $operation->startInNew;
+        $slice = array_slice($this->newWords, $operation->startInNew, $len);
+        foreach ($slice as $offset => $s) {
+            $pos = $operation->startInNew + $offset;
+            if (isset($this->placeholderSet[$s]) && isset($this->newIsolatedDiffTags[$pos])) {
+                $result[] = $this->diffIsolatedPlaceholder($operation, $pos, $s);
+            } else {
+                $result[] = $s;
             }
         }
         $this->content .= implode('', $result);
     }
 
-    /**
-     * @param string $text
-     * @param string $attribute
-     *
-     * @return null|string
-     */
+    // ========== Isolated Placeholder Diffing ==========
+
+    protected function diffIsolatedPlaceholder($operation, $pos, $placeholder, $stripWrappingTags = true)
+    {
+        $oldText = implode('', $this->oldIsolatedDiffTags[$operation->startInOld + ($pos - $operation->startInNew)]);
+        $newText = implode('', $this->newIsolatedDiffTags[$pos]);
+
+        if ($this->isPlaceholderType($placeholder, ['ol', 'dl', 'ul'])) return $this->diffList($oldText, $newText);
+        if ($this->config->isUseTableDiffing() && $this->isPlaceholderType($placeholder, 'table')) return $this->diffTables($oldText, $newText);
+        if ($this->isPlaceholderType($placeholder, 'a')) return $this->diffElementsByAttribute($oldText, $newText, 'href', 'a');
+        if ($this->isPlaceholderType($placeholder, 'img')) return $this->diffElementsByAttribute($oldText, $newText, 'src', 'img');
+        if ($this->isPlaceholderType($placeholder, 'picture')) return $this->diffPicture($oldText, $newText);
+        return $this->diffElements($oldText, $newText, $stripWrappingTags);
+    }
+
+    protected function diffElements($oldText, $newText, $stripWrappingTags = true)
+    {
+        $wrapStart = $wrapEnd = '';
+        if ($stripWrappingTags) {
+            $pattern = '/(^<[^>]+>)|(<\/[^>]+>$)/iu';
+            if (preg_match_all($pattern, $newText, $matches)) {
+                $wrapStart = $matches[0][0] ?? '';
+                $wrapEnd = $matches[0][1] ?? '';
+            }
+            $oldText = preg_replace($pattern, '', $oldText);
+            $newText = preg_replace($pattern, '', $newText);
+        }
+        return $wrapStart . self::create($oldText, $newText, $this->config)->build() . $wrapEnd;
+    }
+
+    protected function diffList($oldText, $newText)
+    {
+        return ListDiffLines::create($oldText, $newText, $this->config)->build();
+    }
+
+    protected function diffTables($oldText, $newText)
+    {
+        return TableDiff::create($oldText, $newText, $this->config)->build();
+    }
+
+    protected function diffPicture($oldText, $newText) {
+        if ($oldText !== $newText) {
+            return $this->wrapText($oldText, 'del', 'diffmod') . $this->wrapText($newText, 'ins', 'diffmod');
+        }
+        return $this->diffElements($oldText, $newText);
+    }
+
+    protected function diffElementsByAttribute($oldText, $newText, $attribute, $element)
+    {
+        $oldAttr = $this->getAttributeFromTag($oldText, $attribute);
+        $newAttr = $this->getAttributeFromTag($newText, $attribute);
+        if ($oldAttr !== $newAttr) {
+            $cls = sprintf('diffmod diff%s diff%s', $element, $attribute);
+            return $this->wrapText($oldText, 'del', $cls) . $this->wrapText($newText, 'ins', $cls);
+        }
+        return $this->diffElements($oldText, $newText);
+    }
+
     protected function getAttributeFromTag($text, $attribute)
     {
-        $matches = array();
-        if (preg_match(sprintf('/<[^>]*\b%s\s*=\s*([\'"])(.*)\1[^>]*>/iu', $attribute), $text, $matches)) {
-            return htmlspecialchars_decode($matches[2]);
-        }
-
+        if (preg_match(sprintf('/<[^>]*\b%s\s*=\s*([\'"])(.*)\1[^>]*>/iu', $attribute), $text, $m)) return htmlspecialchars_decode($m[2]);
         return;
     }
 
-    /**
-     * @param string $text
-     *
-     * @return bool
-     */
-    protected function isListPlaceholder($text)
-    {
-        return $this->isPlaceholderType($text, ['ol', 'dl', 'ul']);
-    }
+    // ========== Tag insertion ==========
 
-    /**
-     * @param string $text
-     *
-     * @return bool
-     */
-    public function isLinkPlaceholder($text)
-    {
-        return $this->isPlaceholderType($text, 'a');
-    }
-
-    /**
-     * @param string $text
-     *
-     * @return bool
-     */
-    public function isImagePlaceholder($text)
-    {
-        return $this->isPlaceholderType($text, 'img');
-    }
-
-    public function isPicturePlaceholder($text)
-    {
-        return $this->isPlaceholderType($text, 'picture');
-    }
-
-    /**
-     * @param string       $text
-     * @param array|string $types
-     *
-     * @return bool
-     */
-    protected function isPlaceholderType($text, $types)
-    {
-        if (is_array($types) === false) {
-            $types = [$types];
-        }
-
-        $criteria = [];
-
-        foreach ($types as $type) {
-            if ($this->config->isIsolatedDiffTag($type) === true) {
-                $criteria[] = $this->config->getIsolatedDiffTagPlaceholder($type);
-            } else {
-                $criteria[] = $type;
-            }
-        }
-
-        return in_array($text, $criteria, true);
-    }
-
-    /**
-     * @param string $text
-     *
-     * @return bool
-     */
-    protected function isTablePlaceholder($text)
-    {
-        return $this->isPlaceholderType($text, 'table');
-    }
-
-    /**
-     * @param Operation $operation
-     * @param int       $posInNew
-     *
-     * @return array
-     */
-    protected function findIsolatedDiffTagsInOld($operation, $posInNew)
-    {
-        $offset = $posInNew - $operation->startInNew;
-
-        return $this->oldIsolatedDiffTags[$operation->startInOld + $offset];
-    }
-
-    /**
-     * @param string $tag
-     * @param string $cssClass
-     * @param array  $words
-     */
     protected function insertTag($tag, $cssClass, &$words)
     {
         while (count($words) > 0) {
             $nonTags = $this->extractConsecutiveWords($words, 'noTag');
-
-            if (count($nonTags) > 0) {
-                $this->content .= $this->wrapText(implode('', $nonTags), $tag, $cssClass);
-            }
-
-            if (count($words) === 0) {
-                break;
-            }
+            if ($nonTags) $this->content .= $this->wrapText(implode('', $nonTags), $tag, $cssClass);
+            if (!$words) break;
 
             $workTag = $this->extractConsecutiveWords($words, 'tag');
-
-            if (
-                isset($workTag[0]) === true &&
-                $this->isOpeningTag($workTag[0]) === true &&
-                $this->isClosingTag($workTag[0]) === false
-            ) {
-                if ($this->stringUtil->strpos($workTag[0], 'class=')) {
+            if (isset($workTag[0]) && $this->isOpeningTagFast($workTag[0]) && !$this->isClosingTagFast($workTag[0])) {
+                if (strpos($workTag[0], 'class=') !== false) {
                     $workTag[0] = str_replace('class="', 'class="diffmod ', $workTag[0]);
                 } else {
-                    $isSelfClosing = $this->stringUtil->strpos($workTag[0], '/>') !== false;
-
-                    if ($isSelfClosing === true) {
-                        $workTag[0] = str_replace('/>', ' class="diffmod" />', $workTag[0]);
-                    } else {
-                        $workTag[0] = str_replace('>', ' class="diffmod">', $workTag[0]);
-                    }
+                    $workTag[0] = strpos($workTag[0], '/>') !== false
+                        ? str_replace('/>', ' class="diffmod" />', $workTag[0])
+                        : str_replace('>', ' class="diffmod">', $workTag[0]);
                 }
             }
-
             $appendContent = implode('', $workTag);
-
-            if (isset($workTag[0]) === true && $this->stringUtil->stripos($workTag[0], '<img') !== false) {
+            if (isset($workTag[0]) && stripos($workTag[0], '<img') !== false) {
                 $appendContent = $this->wrapText($appendContent, $tag, $cssClass);
             }
-
             $this->content .= $appendContent;
         }
     }
 
-    /**
-     * @param string $word
-     * @param string $condition
-     *
-     * @return bool
-     */
-    protected function checkCondition($word, $condition)
-    {
-        return $condition == 'tag' ? $this->isTag($word) : !$this->isTag($word);
-    }
-
     protected function wrapText(string $text, string $tagName, string $cssClass) : string
     {
-        if (!$this->config->isSpaceMatching() && trim($text) === '') {
-            return '';
-        }
-
-        return sprintf('<%1$s class="%2$s">%3$s</%1$s>', $tagName, $cssClass, $text);
+        if (!$this->config->isSpaceMatching() && trim($text) === '') return '';
+        return '<' . $tagName . ' class="' . $cssClass . '">' . $text . '</' . $tagName . '>';
     }
 
     /**
-     * @param array  $words
-     * @param string $condition
-     *
-     * @return array
+     * Optimized: direct array_splice, no redundant copies.
      */
     protected function extractConsecutiveWords(&$words, $condition)
     {
-        $indexOfFirstTag = null;
         $words = array_values($words);
-        foreach ($words as $i => $word) {
-            if (!$this->checkCondition($word, $condition)) {
-                $indexOfFirstTag = $i;
-                break;
-            }
+        $isTag = ($condition === 'tag');
+        $count = count($words);
+        $splitAt = $count; // default: take all
+
+        for ($i = 0; $i < $count; $i++) {
+            $wIsTag = $this->isTagFast($words[$i]);
+            if ($isTag !== $wIsTag) { $splitAt = $i; break; }
         }
-        if ($indexOfFirstTag !== null) {
-            $items = array();
-            foreach ($words as $pos => $s) {
-                if ($pos >= 0 && $pos < $indexOfFirstTag) {
-                    $items[] = $s;
-                }
-            }
-            if ($indexOfFirstTag > 0) {
-                array_splice($words, 0, $indexOfFirstTag);
-            }
 
-            return $items;
-        } else {
-            $items = array();
-            foreach ($words as $pos => $s) {
-                if ($pos >= 0 && $pos <= count($words)) {
-                    $items[] = $s;
-                }
-            }
-            array_splice($words, 0, count($words));
+        if ($splitAt === 0) return [];
+        if ($splitAt === $count) { $items = $words; $words = []; return $items; }
+        return array_splice($words, 0, $splitAt);
+    }
 
-            return $items;
+    // ========== Placeholder type checking ==========
+
+    public function isLinkPlaceholder($text)    { return $this->isPlaceholderType($text, 'a'); }
+    public function isImagePlaceholder($text)   { return $this->isPlaceholderType($text, 'img'); }
+    public function isPicturePlaceholder($text)  { return $this->isPlaceholderType($text, 'picture'); }
+    protected function isListPlaceholder($text) { return $this->isPlaceholderType($text, ['ol', 'dl', 'ul']); }
+    protected function isTablePlaceholder($text){ return $this->isPlaceholderType($text, 'table'); }
+
+    protected function isPlaceholderType($text, $types)
+    {
+        if (!is_array($types)) $types = [$types];
+        foreach ($types as $type) {
+            $ph = $this->config->isIsolatedDiffTag($type) ? $this->config->getIsolatedDiffTagPlaceholder($type) : $type;
+            if ($text === $ph) return true;
         }
+        return false;
     }
 
-    /**
-     * @param string $item
-     *
-     * @return bool
-     */
-    protected function isTag($item)
-    {
-        return $this->isOpeningTag($item) || $this->isClosingTag($item);
-    }
+    // ========== Matching Algorithm ==========
 
-    protected function isOpeningTag($item) : bool
-    {
-        return preg_match('#<[^>]+>\\s*#iUu', $item) === 1;
-    }
-
-    protected function isClosingTag($item) : bool
-    {
-        return preg_match('#</[^>]+>\\s*#iUu', $item) === 1;
-    }
-
-    /**
-     * @return Operation[]
-     */
     protected function operations()
     {
-        $positionInOld = 0;
-        $positionInNew = 0;
-        $operations = array();
-
-        $matches   = $this->matchingBlocks();
+        $positionInOld = $positionInNew = 0;
+        $operations = [];
+        $matches = $this->matchingBlocks();
         $matches[] = new MatchingBlock(count($this->oldWords), count($this->newWords), 0);
 
         foreach ($matches as $match) {
-            $matchStartsAtCurrentPositionInOld = ($positionInOld === $match->startInOld);
-            $matchStartsAtCurrentPositionInNew = ($positionInNew === $match->startInNew);
+            $mOld = ($positionInOld === $match->startInOld);
+            $mNew = ($positionInNew === $match->startInNew);
+            if (!$mOld && !$mNew) $action = 'replace';
+            elseif ($mOld && !$mNew) $action = 'insert';
+            elseif (!$mOld && $mNew) $action = 'delete';
+            else $action = 'none';
 
-            if ($matchStartsAtCurrentPositionInOld === false && $matchStartsAtCurrentPositionInNew === false) {
-                $action = 'replace';
-            } elseif ($matchStartsAtCurrentPositionInOld === true && $matchStartsAtCurrentPositionInNew === false) {
-                $action = 'insert';
-            } elseif ($matchStartsAtCurrentPositionInOld === false && $matchStartsAtCurrentPositionInNew === true) {
-                $action = 'delete';
-            } else { // This occurs if the first few words are the same in both versions
-                $action = 'none';
-            }
-
-            if ($action !== 'none') {
-                $operations[] = new Operation($action, $positionInOld, $match->startInOld, $positionInNew, $match->startInNew);
-            }
-
-            if (count($match) !== 0) {
-                $operations[] = new Operation('equal', $match->startInOld, $match->endInOld(), $match->startInNew, $match->endInNew());
-            }
-
+            if ($action !== 'none') $operations[] = new Operation($action, $positionInOld, $match->startInOld, $positionInNew, $match->startInNew);
+            if (count($match) !== 0) $operations[] = new Operation('equal', $match->startInOld, $match->endInOld(), $match->startInNew, $match->endInNew());
             $positionInOld = $match->endInOld();
             $positionInNew = $match->endInNew();
         }
-
         return $operations;
     }
 
-    /**
-     * @return MatchingBlock[]
-     */
     protected function matchingBlocks()
     {
-        $matchingBlocks = array();
-        $this->findMatchingBlocks(0, count($this->oldWords), 0, count($this->newWords), $matchingBlocks);
-
-        return $matchingBlocks;
+        $blocks = [];
+        $this->findMatchingBlocks(0, count($this->oldWords), 0, count($this->newWords), $blocks);
+        return $blocks;
     }
 
-    /**
-     * @param MatchingBlock[] $matchingBlocks
-     */
-    protected function findMatchingBlocks(int $startInOld, int $endInOld, int $startInNew, int $endInNew, array &$matchingBlocks) : void
+    protected function findMatchingBlocks(int $startInOld, int $endInOld, int $startInNew, int $endInNew, array &$blocks) : void
     {
         $match = $this->findMatch($startInOld, $endInOld, $startInNew, $endInNew);
-
-        if ($match === null) {
-            return;
-        }
-
-        if ($startInOld < $match->startInOld && $startInNew < $match->startInNew) {
-            $this->findMatchingBlocks($startInOld, $match->startInOld, $startInNew, $match->startInNew, $matchingBlocks);
-        }
-
-        $matchingBlocks[] = $match;
-
-        if ($match->endInOld() < $endInOld && $match->endInNew() < $endInNew) {
-            $this->findMatchingBlocks($match->endInOld(), $endInOld, $match->endInNew(), $endInNew, $matchingBlocks);
-        }
+        if ($match === null) return;
+        if ($startInOld < $match->startInOld && $startInNew < $match->startInNew)
+            $this->findMatchingBlocks($startInOld, $match->startInOld, $startInNew, $match->startInNew, $blocks);
+        $blocks[] = $match;
+        if ($match->endInOld() < $endInOld && $match->endInNew() < $endInNew)
+            $this->findMatchingBlocks($match->endInOld(), $endInOld, $match->endInNew(), $endInNew, $blocks);
     }
 
     /**
-     * @param string $word
-     *
-     * @return string
+     * Core matching: uses precomputed whitespace bitmap for O(1) whitespace checks.
      */
-    protected function stripTagAttributes($word)
-    {
-        $space = $this->stringUtil->strpos($word, ' ', 1);
-
-        if ($space > 0) {
-            return '<' . $this->stringUtil->substr($word, 1, $space) . '>';
-        }
-
-        return trim($word, '<>');
-    }
-
     protected function findMatch(int $startInOld, int $endInOld, int $startInNew, int $endInNew) : ?MatchingBlock
     {
-        $groupDiffs     = $this->isGroupDiffs();
+        $groupDiffs = $this->config->isGroupDiffs();
         $bestMatchInOld = $startInOld;
         $bestMatchInNew = $startInNew;
         $bestMatchSize = 0;
@@ -776,103 +426,102 @@ class HtmlDiff extends AbstractDiff
 
         for ($indexInOld = $startInOld; $indexInOld < $endInOld; ++$indexInOld) {
             $newMatchLengthAt = [];
+            $word = $this->oldWords[$indexInOld];
+            $index = $this->isTagFast($word) ? $this->stripCached($word) : $word;
 
-            $index = $this->oldWords[ $indexInOld ];
-
-            if ($this->isTag($index) === true) {
-                $index = $this->stripTagAttributes($index);
-            }
-
-            if (isset($this->wordIndices[$index]) === false) {
+            if (!isset($this->wordIndices[$index])) {
                 $matchLengthAt = $newMatchLengthAt;
-
                 continue;
             }
 
             foreach ($this->wordIndices[$index] as $indexInNew) {
-                if ($indexInNew < $startInNew) {
-                    continue;
-                }
+                if ($indexInNew < $startInNew) continue;
+                if ($indexInNew >= $endInNew) break;
 
-                if ($indexInNew >= $endInNew) {
-                    break;
-                }
-
-                $newMatchLength =
-                    (isset($matchLengthAt[$indexInNew - 1]) === true ? ($matchLengthAt[$indexInNew - 1] + 1) : 1);
-
+                $newMatchLength = (isset($matchLengthAt[$indexInNew - 1]) ? $matchLengthAt[$indexInNew - 1] + 1 : 1);
                 $newMatchLengthAt[$indexInNew] = $newMatchLength;
 
                 if ($newMatchLength > $bestMatchSize ||
-                    (
-                        $groupDiffs === true &&
-                        $bestMatchSize > 0 &&
-                        $this->oldTextIsOnlyWhitespace($bestMatchInOld, $bestMatchSize) === true
-                    )
+                    ($groupDiffs && $bestMatchSize > 0 && $this->isOnlyWhitespace($bestMatchInOld, $bestMatchSize))
                 ) {
                     $bestMatchInOld = $indexInOld - $newMatchLength + 1;
                     $bestMatchInNew = $indexInNew - $newMatchLength + 1;
-                    $bestMatchSize  = $newMatchLength;
+                    $bestMatchSize = $newMatchLength;
                 }
             }
-
             $matchLengthAt = $newMatchLengthAt;
         }
 
-        // Skip match if none found or match consists only of whitespace
-        if ($bestMatchSize !== 0 &&
-            (
-                $groupDiffs === false ||
-                $this->oldTextIsOnlyWhitespace($bestMatchInOld, $bestMatchSize) === false
-            )
-        ) {
+        if ($bestMatchSize !== 0 && (!$groupDiffs || !$this->isOnlyWhitespace($bestMatchInOld, $bestMatchSize))) {
             return new MatchingBlock($bestMatchInOld, $bestMatchInNew, $bestMatchSize);
         }
-
         return null;
     }
 
-    protected function oldTextIsOnlyWhitespace(int $startingAtWord, int $wordCount) : bool
+    /**
+     * O(k) whitespace check using precomputed bitmap. No trim() calls.
+     */
+    protected function isOnlyWhitespace(int $start, int $count) : bool
     {
-        $isWhitespace = true;
-
-        // oldTextIsWhitespace get called consecutively by findMatch, with the same parameters.
-        // by caching the previous result, we speed up the algorithm by more then 50%
-        static $lastStartingWordOffset = null;
-        static $lastWordCount          = null;
-        static $cache                  = null;
-
-        if ($this->resetCache === true) {
-            $cache = null;
-
-            $this->resetCache = false;
+        for ($i = $start, $end = $start + $count; $i < $end; $i++) {
+            if (!$this->oldWordIsWhitespace[$i]) return false;
         }
+        return true;
+    }
 
-        if (
-            $cache !== null &&
-            $lastWordCount === $wordCount &&
-            $lastStartingWordOffset === $startingAtWord
-        ) { // Hit
-            return $cache;
-        } // Miss
+    // Kept for API compatibility
+    protected function oldTextIsOnlyWhitespace(int $start, int $count) : bool
+    {
+        return $this->isOnlyWhitespace($start, $count);
+    }
 
-        for ($index = $startingAtWord; $index < ($startingAtWord + $wordCount); $index++) {
-            // Assigning the oldWord to a variable is slightly faster then searching by reference twice
-            // in the if statement
-            $oldWord = $this->oldWords[$index];
+    // ========== Fast tag detection (character-level + cache) ==========
 
-            if ($oldWord !== '' && trim($oldWord) !== '') {
-                $isWhitespace = false;
+    protected function isTagFast($item) : bool
+    {
+        if (isset($this->tagCache[$item])) return $this->tagCache[$item];
+        $r = (isset($item[0]) && $item[0] === '<');
+        $this->tagCache[$item] = $r;
+        return $r;
+    }
 
-                break;
-            }
-        }
+    protected function isOpeningTagFast($item) : bool
+    {
+        if (isset($this->openCache[$item])) return $this->openCache[$item];
+        $r = (isset($item[0]) && $item[0] === '<' && (!isset($item[1]) || $item[1] !== '/'));
+        $this->openCache[$item] = $r;
+        return $r;
+    }
 
-        $lastWordCount          = $wordCount;
-        $lastStartingWordOffset = $startingAtWord;
+    protected function isClosingTagFast($item) : bool
+    {
+        if (isset($this->closeCache[$item])) return $this->closeCache[$item];
+        $r = (isset($item[1]) && $item[0] === '<' && $item[1] === '/');
+        $this->closeCache[$item] = $r;
+        return $r;
+    }
 
-        $cache = $isWhitespace;
+    protected function isTag($item) { return $this->isTagFast($item); }
+    protected function isOpeningTag($item) : bool { return $this->isOpeningTagFast($item); }
+    protected function isClosingTag($item) : bool { return $this->isClosingTagFast($item); }
 
-        return $cache;
+    protected function stripCached($word) : string
+    {
+        if (isset($this->stripCache[$word])) return $this->stripCache[$word];
+        $r = $this->stripTagAttributes($word);
+        $this->stripCache[$word] = $r;
+        return $r;
+    }
+
+    protected function stripTagAttributes($word)
+    {
+        $space = strpos($word, ' ', 1);
+        if ($space > 0) return '<' . substr($word, 1, $space) . '>';
+        return trim($word, '<>');
+    }
+
+    protected function findIsolatedDiffTagsInOld($operation, $posInNew)
+    {
+        return $this->oldIsolatedDiffTags[$operation->startInOld + ($posInNew - $operation->startInNew)];
     }
 }

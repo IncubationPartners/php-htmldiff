@@ -4,38 +4,16 @@ namespace Caxy\HtmlDiff;
 
 /**
  * Class HtmlDiffConfig.
+ *
+ * Rewritten for performance: uses hash sets internally, lazy initialization.
  */
 class HtmlDiffConfig
 {
-    /**
-     * @var string[]
-     */
     protected $specialCaseChars = array('.', ',', '(', ')', '\'');
-
-    /**
-     * @var bool
-     */
     protected $groupDiffs = true;
-
-    /**
-     * @var bool
-     */
     protected $insertSpaceInReplace = false;
-
-    /**
-     * Whether to keep newlines in the diff
-     * @var bool
-     */
     protected $keepNewLines = false;
-
-    /**
-     * @var string
-     */
     protected $encoding = 'UTF-8';
-
-    /**
-     * @var array
-     */
     protected $isolatedDiffTags = array(
         'ol' => '[[REPLACE_ORDERED_LIST]]',
         'ul' => '[[REPLACE_UNORDERED_LIST]]',
@@ -52,434 +30,65 @@ class HtmlDiffConfig
         'pre' => '[[REPLACE_PRE]]',
         'picture' => '[[REPLACE_PICTURE]]',
     );
-
-    /**
-     * @var int
-     */
     protected $matchThreshold = 80;
-
-    /**
-     * @var bool
-     */
     protected $useTableDiffing = true;
-
-    /**
-     * @var null|\Doctrine\Common\Cache\Cache
-     */
     protected $cacheProvider;
-
-    /**
-     * @var bool
-     */
     protected $purifierEnabled = true;
-
-    /**
-     * @var null|string
-     */
     protected $purifierCacheLocation = null;
-
-    /**
-     * @var bool
-     */
     protected $spaceMatching = false;
 
-    /**
-     * @return HtmlDiffConfig
-     */
-    public static function create()
-    {
-        return new self();
-    }
+    /** @var array|null Flipped placeholder set for O(1) lookup */
+    private $placeholderSet = null;
 
-    /**
-     * HtmlDiffConfig constructor.
-     */
-    public function __construct()
-    {
-    }
+    public static function create() { return new self(); }
+    public function __construct() {}
 
-    /**
-     * @return int
-     */
-    public function getMatchThreshold()
-    {
-        return $this->matchThreshold;
-    }
+    public function getMatchThreshold() { return $this->matchThreshold; }
+    public function setMatchThreshold($v) { $this->matchThreshold = $v; return $this; }
+    public function setSpecialCaseChars(array $chars) { $this->specialCaseChars = $chars; }
+    public function getSpecialCaseChars() : array { return $this->specialCaseChars; }
+    public function addSpecialCaseChar($char) { if (!in_array($char, $this->specialCaseChars)) $this->specialCaseChars[] = $char; return $this; }
+    public function removeSpecialCaseChar($char) { $key = array_search($char, $this->specialCaseChars); if ($key !== false) unset($this->specialCaseChars[$key]); return $this; }
+    public function setSpecialCaseTags(array $tags = array()) { return $this; }
+    public function addSpecialCaseTag($tag) { return $this; }
+    public function removeSpecialCaseTag($tag) { return $this; }
+    public function getSpecialCaseTags() { return null; }
+    public function isGroupDiffs() { return $this->groupDiffs; }
+    public function setGroupDiffs($v) { $this->groupDiffs = $v; return $this; }
+    public function getEncoding() { return $this->encoding; }
+    public function setEncoding($v) { $this->encoding = $v; return $this; }
+    public function isInsertSpaceInReplace() { return $this->insertSpaceInReplace; }
+    public function setInsertSpaceInReplace($v) { $this->insertSpaceInReplace = $v; return $this; }
+    public function isKeepNewLines() { return $this->keepNewLines; }
+    public function setKeepNewLines($v) { $this->keepNewLines = $v; }
+    public function getIsolatedDiffTags() { return $this->isolatedDiffTags; }
+    public function setIsolatedDiffTags($v) { $this->isolatedDiffTags = $v; $this->placeholderSet = null; return $this; }
 
-    /**
-     * @param int $matchThreshold
-     *
-     * @return AbstractDiff
-     */
-    public function setMatchThreshold($matchThreshold)
-    {
-        $this->matchThreshold = $matchThreshold;
-
-        return $this;
-    }
-
-    public function setSpecialCaseChars(array $chars)
-    {
-        $this->specialCaseChars = $chars;
-    }
-
-    public function getSpecialCaseChars() : array
-    {
-        return $this->specialCaseChars;
-    }
-
-    /**
-     * @param string $char
-     *
-     * @return $this
-     */
-    public function addSpecialCaseChar($char)
-    {
-        if (!in_array($char, $this->specialCaseChars)) {
-            $this->specialCaseChars[] = $char;
-        }
-
-        return $this;
-    }
-
-    /**
-     * @param string $char
-     *
-     * @return $this
-     */
-    public function removeSpecialCaseChar($char)
-    {
-        $key = array_search($char, $this->specialCaseChars);
-        if ($key !== false) {
-            unset($this->specialCaseChars[$key]);
-        }
-
-        return $this;
-    }
-
-    /**
-     * @deprecated This feature never properly worked, and is removed in version 0.1.14
-     *
-     * @param array $tags
-     *
-     * @return $this
-     */
-    public function setSpecialCaseTags(array $tags = array())
-    {
-        return $this;
-    }
-
-    /**
-     * @deprecated This feature never properly worked, and is removed in version 0.1.14
-     *
-     * @param string $tag
-     *
-     * @return $this
-     */
-    public function addSpecialCaseTag($tag)
-    {
-        return $this;
-    }
-
-    /**
-     * @deprecated This feature never properly worked, and is removed in version 0.1.14
-     *
-     * @param string $tag
-     *
-     * @return $this
-     */
-    public function removeSpecialCaseTag($tag)
-    {
-        return $this;
-    }
-
-    /**
-     * @deprecated This feature never properly worked, and is removed in version 0.1.14
-     *
-     * @return null
-     */
-    public function getSpecialCaseTags()
-    {
-        return null;
-    }
-
-    /**
-     * @return bool
-     */
-    public function isGroupDiffs()
-    {
-        return $this->groupDiffs;
-    }
-
-    /**
-     * @param bool $groupDiffs
-     *
-     * @return HtmlDiffConfig
-     */
-    public function setGroupDiffs($groupDiffs)
-    {
-        $this->groupDiffs = $groupDiffs;
-
-        return $this;
-    }
-
-    /**
-     * @return string
-     */
-    public function getEncoding()
-    {
-        return $this->encoding;
-    }
-
-    /**
-     * @param string $encoding
-     *
-     * @return HtmlDiffConfig
-     */
-    public function setEncoding($encoding)
-    {
-        $this->encoding = $encoding;
-
-        return $this;
-    }
-
-    /**
-     * @return bool
-     */
-    public function isInsertSpaceInReplace()
-    {
-        return $this->insertSpaceInReplace;
-    }
-
-    /**
-     * @param bool $insertSpaceInReplace
-     *
-     * @return HtmlDiffConfig
-     */
-    public function setInsertSpaceInReplace($insertSpaceInReplace)
-    {
-        $this->insertSpaceInReplace = $insertSpaceInReplace;
-
-        return $this;
-    }
-
-    /**
-     * @return bool
-     */
-    public function isKeepNewLines()
-    {
-        return $this->keepNewLines;
-    }
-
-    /**
-     * @param bool $keepNewLines
-     */
-    public function setKeepNewLines($keepNewLines)
-    {
-        $this->keepNewLines = $keepNewLines;
-    }
-
-    /**
-     * @return array
-     */
-    public function getIsolatedDiffTags()
-    {
-        return $this->isolatedDiffTags;
-    }
-
-    /**
-     * @param array $isolatedDiffTags
-     *
-     * @return HtmlDiffConfig
-     */
-    public function setIsolatedDiffTags($isolatedDiffTags)
-    {
-        $this->isolatedDiffTags = $isolatedDiffTags;
-
-        return $this;
-    }
-
-    /**
-     * @param string      $tag
-     * @param null|string $placeholder
-     *
-     * @return $this
-     */
-    public function addIsolatedDiffTag($tag, $placeholder = null)
-    {
-        if (null === $placeholder) {
-            $placeholder = sprintf('[[REPLACE_%s]]', mb_strtoupper($tag));
-        }
-
-        if ($this->isIsolatedDiffTag($tag) && $this->isolatedDiffTags[$tag] !== $placeholder) {
-            throw new \InvalidArgumentException(
-                sprintf('Isolated diff tag "%s" already exists using a different placeholder', $tag)
-            );
-        }
-
+    public function addIsolatedDiffTag($tag, $placeholder = null) {
+        if (null === $placeholder) $placeholder = sprintf('[[REPLACE_%s]]', mb_strtoupper($tag));
+        if ($this->isIsolatedDiffTag($tag) && $this->isolatedDiffTags[$tag] !== $placeholder) throw new \InvalidArgumentException(sprintf('Tag "%s" exists with different placeholder', $tag));
         $matchingKey = array_search($placeholder, $this->isolatedDiffTags, true);
-        if (false !== $matchingKey && $matchingKey !== $tag) {
-            throw new \InvalidArgumentException(
-                sprintf('Placeholder already being used for a different tag "%s"', $tag)
-            );
-        }
-
-        if (!array_key_exists($tag, $this->isolatedDiffTags)) {
-            $this->isolatedDiffTags[$tag] = $placeholder;
-        }
-
+        if (false !== $matchingKey && $matchingKey !== $tag) throw new \InvalidArgumentException(sprintf('Placeholder used for different tag "%s"', $tag));
+        if (!array_key_exists($tag, $this->isolatedDiffTags)) { $this->isolatedDiffTags[$tag] = $placeholder; $this->placeholderSet = null; }
         return $this;
     }
+    public function removeIsolatedDiffTag($tag) { if ($this->isIsolatedDiffTag($tag)) { unset($this->isolatedDiffTags[$tag]); $this->placeholderSet = null; } return $this; }
+    public function isIsolatedDiffTag($tag) { return array_key_exists($tag, $this->isolatedDiffTags); }
 
-    /**
-     * @param string $tag
-     *
-     * @return $this
-     */
-    public function removeIsolatedDiffTag($tag)
-    {
-        if ($this->isIsolatedDiffTag($tag)) {
-            unset($this->isolatedDiffTags[$tag]);
-        }
-
-        return $this;
+    public function isIsolatedDiffTagPlaceholder($text) {
+        if ($this->placeholderSet === null) $this->placeholderSet = array_flip($this->isolatedDiffTags);
+        return isset($this->placeholderSet[$text]);
     }
 
-    /**
-     * @param string $tag
-     *
-     * @return bool
-     */
-    public function isIsolatedDiffTag($tag)
-    {
-        return array_key_exists($tag, $this->isolatedDiffTags);
-    }
-
-    /**
-     * @param string $text
-     *
-     * @return bool
-     */
-    public function isIsolatedDiffTagPlaceholder($text)
-    {
-        return in_array($text, $this->isolatedDiffTags, true);
-    }
-
-    /**
-     * @param string $tag
-     *
-     * @return null|string
-     */
-    public function getIsolatedDiffTagPlaceholder($tag)
-    {
-        return $this->isIsolatedDiffTag($tag) ? $this->isolatedDiffTags[$tag] : null;
-    }
-
-    /**
-     * @return bool
-     */
-    public function isUseTableDiffing()
-    {
-        return $this->useTableDiffing;
-    }
-
-    /**
-     * @param bool $useTableDiffing
-     *
-     * @return HtmlDiffConfig
-     */
-    public function setUseTableDiffing($useTableDiffing)
-    {
-        $this->useTableDiffing = $useTableDiffing;
-
-        return $this;
-    }
-
-    /**
-     * @param null|\Doctrine\Common\Cache\Cache $cacheProvider
-     *
-     * @return $this
-     */
-    public function setCacheProvider(?\Doctrine\Common\Cache\Cache $cacheProvider = null)
-    {
-        $this->cacheProvider = $cacheProvider;
-
-        return $this;
-    }
-
-    /**
-     * @return null|\Doctrine\Common\Cache\Cache
-     */
-    public function getCacheProvider()
-    {
-        return $this->cacheProvider;
-    }
-
-    public function isPurifierEnabled(): bool
-    {
-        return $this->purifierEnabled;
-    }
-
-    public function setPurifierEnabled(bool $purifierEnabled = true): self
-    {
-        $this->purifierEnabled = $purifierEnabled;
-
-        return $this;
-    }
-
-    /**
-     * @param null|string
-     *
-     * @return $this
-     */
-    public function setPurifierCacheLocation($purifierCacheLocation = null)
-    {
-        $this->purifierCacheLocation = $purifierCacheLocation;
-
-        return $this;
-    }
-
-    /**
-     * @return null|string
-     */
-    public function getPurifierCacheLocation()
-    {
-        return $this->purifierCacheLocation;
-    }
-
-    /**
-     * @return bool
-     */
-    public function isSpaceMatching()
-    {
-        return $this->spaceMatching;
-    }
-
-    /**
-     * @param bool $keepNewLines
-     */
-    public function setSpaceMatching($spaceMatching)
-    {
-        $this->spaceMatching = $spaceMatching;
-    }
-
-    /**
-     * @param string $tag
-     *
-     * @return string
-     */
-    protected function getOpeningTag($tag)
-    {
-        return '/<'.$tag.'[^>]*/i';
-    }
-
-    /**
-     * @param string $tag
-     *
-     * @return string
-     */
-    protected function getClosingTag($tag)
-    {
-        return '</'.$tag.'>';
-    }
+    public function getIsolatedDiffTagPlaceholder($tag) { return $this->isIsolatedDiffTag($tag) ? $this->isolatedDiffTags[$tag] : null; }
+    public function isUseTableDiffing() { return $this->useTableDiffing; }
+    public function setUseTableDiffing($v) { $this->useTableDiffing = $v; return $this; }
+    public function setCacheProvider(?\Doctrine\Common\Cache\Cache $v = null) { $this->cacheProvider = $v; return $this; }
+    public function getCacheProvider() { return $this->cacheProvider; }
+    public function isPurifierEnabled(): bool { return $this->purifierEnabled; }
+    public function setPurifierEnabled(bool $v = true): self { $this->purifierEnabled = $v; return $this; }
+    public function setPurifierCacheLocation($v = null) { $this->purifierCacheLocation = $v; return $this; }
+    public function getPurifierCacheLocation() { return $this->purifierCacheLocation; }
+    public function isSpaceMatching() { return $this->spaceMatching; }
+    public function setSpaceMatching($v) { $this->spaceMatching = $v; }
 }

@@ -8,108 +8,85 @@ use Caxy\HtmlDiff\HtmlDiffConfig;
 use Caxy\HtmlDiff\Operation;
 
 /**
- * Class TableDiff.
+ * Class TableDiff - Complete rewrite with optimal algorithms.
+ *
+ * Key algorithmic improvements:
+ * 1. Row matching uses content hashing for O(1) identity checks
+ * 2. Cell content compared by text hash before expensive similar_text
+ * 3. Identical cells short-circuit completely (no HtmlDiff created)
+ * 4. Row text precomputed once, not re-extracted per comparison
+ * 5. similar_text called on stripped text (cheaper than HTML)
  */
 class TableDiff extends AbstractDiff
 {
-    /**
-     * @var null|Table
-     */
     protected $oldTable = null;
-
-    /**
-     * @var null|Table
-     */
     protected $newTable = null;
-
-    /**
-     * @var null|\DOMElement
-     */
     protected $diffTable = null;
-
-    /**
-     * @var null|\DOMDocument
-     */
     protected $diffDom = null;
-
-    /**
-     * @var int
-     */
     protected $newRowOffsets = 0;
-
-    /**
-     * @var int
-     */
     protected $oldRowOffsets = 0;
-
-    /**
-     * @var array
-     */
     protected $cellValues = array();
 
-    /**
-     * @param string              $oldText
-     * @param string              $newText
-     * @param HtmlDiffConfig|null $config
-     *
-     * @return self
-     */
+    /** @var string[] Precomputed text content per row: "prefix:rowIndex" => text */
+    private $rowText = [];
+
+    /** @var string[] Precomputed inner HTML per cell: "prefix:row:cell" => html */
+    private $cellHtml = [];
+
+    /** @var string[] Content hash per cell for fast equality */
+    private $cellHash = [];
+
     public static function create($oldText, $newText, ?HtmlDiffConfig $config = null)
     {
         $diff = new self($oldText, $newText);
-
-        if (null !== $config) {
-            $diff->setConfig($config);
-        }
-
+        if (null !== $config) $diff->setConfig($config);
         return $diff;
     }
 
-    /**
-     * TableDiff constructor.
-     *
-     * @param string     $oldText
-     * @param string     $newText
-     * @param string     $encoding
-     * @param array|null $specialCaseTags
-     * @param bool|null  $groupDiffs
-     */
-    public function __construct(
-        $oldText,
-        $newText,
-        $encoding = 'UTF-8',
-        $specialCaseTags = null,
-        $groupDiffs = null
-    ) {
+    public function __construct($oldText, $newText, $encoding = 'UTF-8', $specialCaseTags = null, $groupDiffs = null)
+    {
         parent::__construct($oldText, $newText, $encoding, $specialCaseTags, $groupDiffs);
     }
 
-    /**
-     * @return string
-     */
     public function build()
     {
         $this->prepare();
 
         if ($this->hasDiffCache() && $this->getDiffCache()->contains($this->oldText, $this->newText)) {
             $this->content = $this->getDiffCache()->fetch($this->oldText, $this->newText);
-
             return $this->content;
         }
 
         $this->buildTableDoms();
-
         $this->diffDom = new \DOMDocument();
-
         $this->indexCellValues($this->newTable);
-
         $this->diffTableContent();
 
         if ($this->hasDiffCache()) {
             $this->getDiffCache()->save($this->oldText, $this->newText, $this->content);
         }
-
         return $this->content;
+    }
+
+    /**
+     * Precompute all row text and cell HTML/hashes for both tables.
+     * This is the key optimization - done once upfront instead of per-comparison.
+     */
+    private function precomputeTableData()
+    {
+        foreach (['old' => $this->oldTable, 'new' => $this->newTable] as $prefix => $table) {
+            foreach ($table->getRows() as $ri => $row) {
+                $rowParts = [];
+                foreach ($row->getCells() as $ci => $cell) {
+                    $html = $cell->getInnerHtml();
+                    $key = "$prefix:$ri:$ci";
+                    $this->cellHtml[$key] = $html;
+                    $this->cellHash[$key] = md5($html);
+                    $rowParts[] = trim($cell->getDomNode()->textContent);
+                }
+                $this->rowText["$prefix:$ri"] = implode("\0", $rowParts);
+            }
+        }
     }
 
     protected function diffTableContent()
@@ -121,466 +98,381 @@ class TableDiff extends AbstractDiff
         $oldRows = $this->oldTable->getRows();
         $newRows = $this->newTable->getRows();
 
-        $oldMatchData = array();
-        $newMatchData = array();
+        // Precompute all data ONCE
+        $this->precomputeTableData();
 
-        /* @var $oldRow TableRow */
-        foreach ($oldRows as $oldIndex => $oldRow) {
-            $oldMatchData[$oldIndex] = array();
+        // TWO-PHASE ROW MATCHING:
+        // Phase 1: Hash-based O(n) matching for identical rows.
+        // Phase 2: similar_text only for unmatched rows.
 
-            // Get match percentages
-            /* @var $newRow TableRow */
-            foreach ($newRows as $newIndex => $newRow) {
-                if (!array_key_exists($newIndex, $newMatchData)) {
-                    $newMatchData[$newIndex] = array();
+        $oldRowHashes = [];
+        $newRowHashes = [];
+        foreach ($oldRows as $oi => $row) {
+            $oldRowHashes[$oi] = md5($this->rowText["old:$oi"] ?? '');
+        }
+        foreach ($newRows as $ni => $row) {
+            $newRowHashes[$ni] = md5($this->rowText["new:$ni"] ?? '');
+        }
+
+        // Phase 1: Greedy positional hash matching
+        $hashMatchedOld = [];
+        $hashMatchedNew = [];
+
+        // First pass: match rows at the same index
+        foreach ($newRowHashes as $ni => $nh) {
+            if (isset($oldRowHashes[$ni]) && $nh === $oldRowHashes[$ni] && !isset($hashMatchedOld[$ni])) {
+                $hashMatchedOld[$ni] = $ni;
+                $hashMatchedNew[$ni] = $ni;
+            }
+        }
+
+        // Second pass: match remaining identical rows by nearest position
+        $unmatchedOldByHash = [];
+        foreach ($oldRowHashes as $oi => $oh) {
+            if (!isset($hashMatchedOld[$oi])) {
+                $unmatchedOldByHash[$oh][] = $oi;
+            }
+        }
+        foreach ($newRowHashes as $ni => $nh) {
+            if (!isset($hashMatchedNew[$ni]) && isset($unmatchedOldByHash[$nh]) && !empty($unmatchedOldByHash[$nh])) {
+                $oi = array_shift($unmatchedOldByHash[$nh]);
+                $hashMatchedOld[$oi] = $ni;
+                $hashMatchedNew[$ni] = $oi;
+            }
+        }
+
+        // Phase 2: Build match matrix for remaining rows
+        $oldMatchData = [];
+        $newMatchData = [];
+
+        foreach ($oldRows as $oi => $oldRow) {
+            $oldMatchData[$oi] = [];
+            foreach ($newRows as $ni => $newRow) {
+                if (!isset($newMatchData[$ni])) $newMatchData[$ni] = [];
+
+                if (isset($hashMatchedOld[$oi]) && $hashMatchedOld[$oi] === $ni) {
+                    $pct = $this->computeHashMatchScore($oi, $ni, $oldRow, $newRow);
+                    $oldMatchData[$oi][$ni] = $pct;
+                    $newMatchData[$ni][$oi] = $pct;
+                } elseif (!isset($hashMatchedOld[$oi]) && !isset($hashMatchedNew[$ni])) {
+                    $pct = $this->getMatchPercentage($oldRow, $newRow, $oi, $ni);
+                    $oldMatchData[$oi][$ni] = $pct;
+                    $newMatchData[$ni][$oi] = $pct;
+                } else {
+                    $oldMatchData[$oi][$ni] = 0;
+                    $newMatchData[$ni][$oi] = 0;
                 }
-
-                // similar_text
-                $percentage = $this->getMatchPercentage($oldRow, $newRow, $oldIndex, $newIndex);
-
-                $oldMatchData[$oldIndex][$newIndex] = $percentage;
-                $newMatchData[$newIndex][$oldIndex] = $percentage;
             }
         }
 
         $matches = $this->getRowMatches($oldMatchData, $newMatchData);
+
+        // Collect diff rows with their section info instead of appending directly
+        $this->pendingDiffRows = [];
         $this->diffTableRowsWithMatches($oldRows, $newRows, $matches);
+
+        // Now rebuild the table with proper section structure
+        $this->rebuildTableWithSections();
 
         $this->content = $this->htmlFromNode($this->diffTable);
     }
 
     /**
-     * @param TableRow[] $oldRows
-     * @param TableRow[] $newRows
-     * @param RowMatch[] $matches
+     * Fast score for hash-matched (identical content) rows.
      */
+    private function computeHashMatchScore(int $oi, int $ni, TableRow $oldRow, TableRow $newRow) : float
+    {
+        $firstCellWeight = 1.5;
+        $indexDeltaWeight = 0.25 * abs($oi - $ni);
+        $minCells = min(count($newRow->getCells()), count($oldRow->getCells()));
+        $totalCount = ($minCells + $firstCellWeight + $indexDeltaWeight) * 100;
+        return ($totalCount > 0) ? ((($minCells + $firstCellWeight) * 100) / $totalCount) : 0;
+    }
+
+    /**
+     * Pending diff rows collected during diffTableRowsWithMatches.
+     * Each entry: ['node' => DOMNode, 'section' => string]
+     * @var array
+     */
+    private $pendingDiffRows = [];
+
+    /**
+     * Rebuild the diff table output with proper thead/tbody/tfoot wrappers.
+     * Also preserves non-row children of the table element such as
+     * <caption> and <colgroup>.
+     */
+    private function rebuildTableWithSections()
+    {
+        // First, restore non-row child elements (caption, colgroup) from the new table.
+        // These are lost by cloneNode(false) and not handled by row diffing.
+        $newTableNode = $this->newTable->getDomNode();
+        if ($newTableNode && $newTableNode->childNodes) {
+            // Collect elements to prepend (caption must come first per HTML spec, then colgroup)
+            $prependNodes = [];
+            foreach ($newTableNode->childNodes as $child) {
+                if ($child->nodeType === XML_ELEMENT_NODE
+                    && in_array($child->nodeName, ['caption', 'colgroup', 'col'])) {
+                    $prependNodes[] = $this->diffDom->importNode($child, true);
+                }
+            }
+            // If both old and new have captions and they differ, diff the caption content
+            if (!empty($prependNodes)) {
+                $oldTableNode = $this->oldTable->getDomNode();
+                $oldCaption = null;
+                if ($oldTableNode && $oldTableNode->childNodes) {
+                    foreach ($oldTableNode->childNodes as $child) {
+                        if ($child->nodeType === XML_ELEMENT_NODE && $child->nodeName === 'caption') {
+                            $oldCaption = $child;
+                            break;
+                        }
+                    }
+                }
+
+                foreach ($prependNodes as $node) {
+                    if ($node->nodeName === 'caption' && $oldCaption !== null) {
+                        // Diff caption content
+                        $oldCaptionHtml = $this->getInnerHtml($oldCaption);
+                        $newCaptionHtml = $this->getInnerHtml($node);
+                        if ($oldCaptionHtml !== $newCaptionHtml) {
+                            $diffedCaption = HtmlDiff::create(
+                                mb_convert_encoding($oldCaptionHtml, 'UTF-8', 'HTML-ENTITIES'),
+                                mb_convert_encoding($newCaptionHtml, 'UTF-8', 'HTML-ENTITIES'),
+                                $this->config
+                            )->build();
+                            // Clear and set diffed content
+                            while ($node->firstChild) { $node->removeChild($node->firstChild); }
+                            $this->setInnerHtml($node, $diffedCaption);
+                        }
+                    }
+                    $this->diffTable->appendChild($node);
+                }
+            }
+        }
+
+        if (empty($this->pendingDiffRows)) return;
+
+        // Group consecutive rows by section
+        $groups = [];
+        $currentSection = null;
+        $currentGroup = [];
+
+        foreach ($this->pendingDiffRows as $entry) {
+            $section = $entry['section'];
+            if ($section !== $currentSection) {
+                if ($currentGroup) {
+                    $groups[] = ['section' => $currentSection, 'rows' => $currentGroup];
+                }
+                $currentSection = $section;
+                $currentGroup = [$entry['node']];
+            } else {
+                $currentGroup[] = $entry['node'];
+            }
+        }
+        if ($currentGroup) {
+            $groups[] = ['section' => $currentSection, 'rows' => $currentGroup];
+        }
+
+        // Append groups to the table
+        foreach ($groups as $group) {
+            $sectionName = $group['section'];
+            if ($sectionName !== '' && in_array($sectionName, ['thead', 'tbody', 'tfoot'])) {
+                $sectionNode = $this->diffDom->createElement($sectionName);
+                foreach ($group['rows'] as $rowNode) {
+                    $sectionNode->appendChild($rowNode);
+                }
+                $this->diffTable->appendChild($sectionNode);
+            } else {
+                // No section wrapper — append rows directly
+                foreach ($group['rows'] as $rowNode) {
+                    $this->diffTable->appendChild($rowNode);
+                }
+            }
+        }
+    }
+
+    /**
+     * REWRITTEN: Tiered matching strategy.
+     * 1. Exact row text hash match -> instant 100%
+     * 2. Per-cell: hash match -> instant 100% for that cell
+     * 3. Per-cell: text strip + similar_text as fallback
+     */
+    protected function getMatchPercentage(TableRow $oldRow, TableRow $newRow, $oldIndex, $newIndex)
+    {
+        $firstCellWeight = 1.5;
+        $indexDeltaWeight = 0.25 * abs($oldIndex - $newIndex);
+        $oldCells = $oldRow->getCells();
+        $newCells = $newRow->getCells();
+        $minCells = min(count($newCells), count($oldCells));
+        $totalCount = ($minCells + $firstCellWeight + $indexDeltaWeight) * 100;
+
+        // Fast path: identical row text content
+        $oldRowText = $this->rowText["old:$oldIndex"] ?? '';
+        $newRowText = $this->rowText["new:$newIndex"] ?? '';
+        if ($oldRowText === $newRowText && $oldRowText !== '') {
+            return ($totalCount > 0) ? ((($minCells + $firstCellWeight) * 100) / $totalCount) : 0;
+        }
+
+        $thresholdCount = 0;
+        $matchThresholdHalf = $this->config->getMatchThreshold() * 0.50;
+
+        foreach ($newCells as $ci => $newCell) {
+            if (!isset($oldCells[$ci])) continue;
+
+            $oldKey = "old:$oldIndex:$ci";
+            $newKey = "new:$newIndex:$ci";
+
+            // Tier 1: Hash comparison (O(1))
+            if (($this->cellHash[$oldKey] ?? '') === ($this->cellHash[$newKey] ?? '') && isset($this->cellHash[$oldKey])) {
+                $percentage = 100.0;
+            } else {
+                // Tier 2: Text content comparison (much cheaper than HTML similar_text)
+                $oldHtml = $this->cellHtml[$oldKey] ?? $oldCells[$ci]->getInnerHtml();
+                $newHtml = $this->cellHtml[$newKey] ?? $newCell->getInnerHtml();
+
+                $oldText = strip_tags($oldHtml);
+                $newText = strip_tags($newHtml);
+
+                if ($oldText === $newText) {
+                    $percentage = 95.0;
+                } else {
+                    // Tier 3: Length ratio pre-filter
+                    $oldLen = strlen($oldText);
+                    $newLen = strlen($newText);
+                    if ($oldLen > 0 && $newLen > 0 && min($oldLen, $newLen) / max($oldLen, $newLen) < 0.15) {
+                        $percentage = 5.0;
+                    } else {
+                        // Tier 4: Actual similar_text (on text, not HTML)
+                        $percentage = null;
+                        similar_text($oldText, $newText, $percentage);
+                    }
+                }
+            }
+
+            if ($percentage > $matchThresholdHalf) {
+                $increment = $percentage;
+                if ($ci === 0 && $percentage > 95) $increment *= $firstCellWeight;
+                $thresholdCount += $increment;
+            }
+        }
+
+        return ($totalCount > 0) ? ($thresholdCount / $totalCount) : 0;
+    }
+
+    // ========== Row matching (unchanged algorithm, slightly cleaned up) ==========
+
+    protected function getRowMatches($oldMatchData, $newMatchData)
+    {
+        $matches = [];
+        $this->findRowMatches($newMatchData, 0, count($oldMatchData), 0, count($newMatchData), $matches);
+        return $matches;
+    }
+
+    protected function findRowMatches($newMatchData, $startInOld, $endInOld, $startInNew, $endInNew, &$matches)
+    {
+        $match = $this->findRowMatch($newMatchData, $startInOld, $endInOld, $startInNew, $endInNew);
+        if ($match === null) return;
+        if ($startInOld < $match->getStartInOld() && $startInNew < $match->getStartInNew())
+            $this->findRowMatches($newMatchData, $startInOld, $match->getStartInOld(), $startInNew, $match->getStartInNew(), $matches);
+        $matches[] = $match;
+        if ($match->getEndInOld() < $endInOld && $match->getEndInNew() < $endInNew)
+            $this->findRowMatches($newMatchData, $match->getEndInOld(), $endInOld, $match->getEndInNew(), $endInNew, $matches);
+    }
+
+    protected function findRowMatch($newMatchData, $startInOld, $endInOld, $startInNew, $endInNew)
+    {
+        $bestMatch = null;
+        $bestPct = 0;
+        foreach ($newMatchData as $ni => $oldMatches) {
+            if ($ni < $startInNew) continue;
+            if ($ni >= $endInNew) break;
+            foreach ($oldMatches as $oi => $pct) {
+                if ($oi < $startInOld) continue;
+                if ($oi >= $endInOld) break;
+                if ($pct > $bestPct) { $bestPct = $pct; $bestMatch = ['o' => $oi, 'n' => $ni]; }
+            }
+        }
+        if ($bestMatch) return new RowMatch($bestMatch['n'], $bestMatch['o'], $bestMatch['n'] + 1, $bestMatch['o'] + 1, $bestPct);
+        return null;
+    }
+
+    // ========== Row diffing operations ==========
+
     protected function diffTableRowsWithMatches($oldRows, $newRows, $matches)
     {
-        $operations = array();
-
-        $indexInOld = 0;
-        $indexInNew = 0;
-
+        $operations = [];
+        $indexInOld = $indexInNew = 0;
         $oldRowCount = count($oldRows);
         $newRowCount = count($newRows);
-
         $matches[] = new RowMatch($newRowCount, $oldRowCount, $newRowCount, $oldRowCount);
 
-        // build operations
         foreach ($matches as $match) {
-            $matchAtIndexInOld = $indexInOld === $match->getStartInOld();
-            $matchAtIndexInNew = $indexInNew === $match->getStartInNew();
-
+            $mOld = ($indexInOld === $match->getStartInOld());
+            $mNew = ($indexInNew === $match->getStartInNew());
             $action = 'equal';
+            if (!$mOld && !$mNew) $action = 'replace';
+            elseif ($mOld && !$mNew) $action = 'insert';
+            elseif (!$mOld && $mNew) $action = 'delete';
 
-            if (!$matchAtIndexInOld && !$matchAtIndexInNew) {
-                $action = 'replace';
-            } elseif ($matchAtIndexInOld && !$matchAtIndexInNew) {
-                $action = 'insert';
-            } elseif (!$matchAtIndexInOld && $matchAtIndexInNew) {
-                $action = 'delete';
-            }
-
-            if ($action !== 'equal') {
-                $operations[] = new Operation(
-                    $action,
-                    $indexInOld,
-                    $match->getStartInOld(),
-                    $indexInNew,
-                    $match->getStartInNew()
-                );
-            }
-
-            $operations[] = new Operation(
-                'equal',
-                $match->getStartInOld(),
-                $match->getEndInOld(),
-                $match->getStartInNew(),
-                $match->getEndInNew()
-            );
-
+            if ($action !== 'equal') $operations[] = new Operation($action, $indexInOld, $match->getStartInOld(), $indexInNew, $match->getStartInNew());
+            $operations[] = new Operation('equal', $match->getStartInOld(), $match->getEndInOld(), $match->getStartInNew(), $match->getEndInNew());
             $indexInOld = $match->getEndInOld();
             $indexInNew = $match->getEndInNew();
         }
 
-        $appliedRowSpans = array();
-
-        // process operations
-        foreach ($operations as $operation) {
-            switch ($operation->action) {
-                case 'equal':
-                    $this->processEqualOperation($operation, $oldRows, $newRows, $appliedRowSpans);
-                    break;
-
-                case 'delete':
-                    $this->processDeleteOperation($operation, $oldRows, $appliedRowSpans);
-                    break;
-
-                case 'insert':
-                    $this->processInsertOperation($operation, $newRows, $appliedRowSpans);
-                    break;
-
-                case 'replace':
-                    $this->processReplaceOperation($operation, $oldRows, $newRows, $appliedRowSpans);
-                    break;
+        $appliedRowSpans = [];
+        foreach ($operations as $op) {
+            switch ($op->action) {
+                case 'equal':   $this->processEqualOperation($op, $oldRows, $newRows, $appliedRowSpans); break;
+                case 'delete':  $this->processDeleteOperation($op, $oldRows, $appliedRowSpans); break;
+                case 'insert':  $this->processInsertOperation($op, $newRows, $appliedRowSpans); break;
+                case 'replace': $this->processDeleteOperation($op, $oldRows, $appliedRowSpans, true); $this->processInsertOperation($op, $newRows, $appliedRowSpans, true); break;
             }
         }
     }
 
-    /**
-     * @param Operation $operation
-     * @param array     $newRows
-     * @param array     $appliedRowSpans
-     * @param bool      $forceExpansion
-     */
-    protected function processInsertOperation(
-        Operation $operation,
-        $newRows,
-        &$appliedRowSpans,
-        $forceExpansion = false
-    ) {
-        $targetRows = array_slice($newRows, $operation->startInNew, $operation->endInNew - $operation->startInNew);
-        foreach ($targetRows as $row) {
+    protected function processInsertOperation(Operation $op, $newRows, &$appliedRowSpans, $forceExpansion = false)
+    {
+        foreach (array_slice($newRows, $op->startInNew, $op->endInNew - $op->startInNew) as $row)
             $this->diffAndAppendRows(null, $row, $appliedRowSpans, $forceExpansion);
-        }
     }
 
-    /**
-     * @param Operation $operation
-     * @param array     $oldRows
-     * @param array     $appliedRowSpans
-     * @param bool      $forceExpansion
-     */
-    protected function processDeleteOperation(
-        Operation $operation,
-        $oldRows,
-        &$appliedRowSpans,
-        $forceExpansion = false
-    ) {
-        $targetRows = array_slice($oldRows, $operation->startInOld, $operation->endInOld - $operation->startInOld);
-        foreach ($targetRows as $row) {
+    protected function processDeleteOperation(Operation $op, $oldRows, &$appliedRowSpans, $forceExpansion = false)
+    {
+        foreach (array_slice($oldRows, $op->startInOld, $op->endInOld - $op->startInOld) as $row)
             $this->diffAndAppendRows($row, null, $appliedRowSpans, $forceExpansion);
+    }
+
+    protected function processEqualOperation(Operation $op, $oldRows, $newRows, &$appliedRowSpans)
+    {
+        $targetOld = array_values(array_slice($oldRows, $op->startInOld, $op->endInOld - $op->startInOld));
+        $targetNew = array_values(array_slice($newRows, $op->startInNew, $op->endInNew - $op->startInNew));
+        foreach ($targetNew as $i => $newRow) {
+            if (isset($targetOld[$i])) $this->diffAndAppendRows($targetOld[$i], $newRow, $appliedRowSpans);
         }
     }
 
-    /**
-     * @param Operation $operation
-     * @param array     $oldRows
-     * @param array     $newRows
-     * @param array     $appliedRowSpans
-     */
-    protected function processEqualOperation(Operation $operation, $oldRows, $newRows, &$appliedRowSpans)
+    protected function diffAndAppendRows($oldRow, $newRow, &$appliedRowSpans, $forceExpansion = false)
     {
-        $targetOldRows = array_values(
-            array_slice($oldRows, $operation->startInOld, $operation->endInOld - $operation->startInOld)
-        );
-        $targetNewRows = array_values(
-            array_slice($newRows, $operation->startInNew, $operation->endInNew - $operation->startInNew)
-        );
+        list($rowDom, $extraRow) = $this->diffRows($oldRow, $newRow, $appliedRowSpans, $forceExpansion);
 
-        foreach ($targetNewRows as $index => $newRow) {
-            if (!isset($targetOldRows[$index])) {
-                continue;
-            }
-
-            $this->diffAndAppendRows($targetOldRows[$index], $newRow, $appliedRowSpans);
-        }
-    }
-
-    /**
-     * @param Operation $operation
-     * @param array     $oldRows
-     * @param array     $newRows
-     * @param array     $appliedRowSpans
-     */
-    protected function processReplaceOperation(Operation $operation, $oldRows, $newRows, &$appliedRowSpans)
-    {
-        $this->processDeleteOperation($operation, $oldRows, $appliedRowSpans, true);
-        $this->processInsertOperation($operation, $newRows, $appliedRowSpans, true);
-    }
-
-    /**
-     * @param array $oldMatchData
-     * @param array $newMatchData
-     *
-     * @return array
-     */
-    protected function getRowMatches($oldMatchData, $newMatchData)
-    {
-        $matches = array();
-
-        $startInOld = 0;
-        $startInNew = 0;
-        $endInOld = count($oldMatchData);
-        $endInNew = count($newMatchData);
-
-        $this->findRowMatches($newMatchData, $startInOld, $endInOld, $startInNew, $endInNew, $matches);
-
-        return $matches;
-    }
-
-    /**
-     * @param array $newMatchData
-     * @param int   $startInOld
-     * @param int   $endInOld
-     * @param int   $startInNew
-     * @param int   $endInNew
-     * @param array $matches
-     */
-    protected function findRowMatches($newMatchData, $startInOld, $endInOld, $startInNew, $endInNew, &$matches)
-    {
-        $match = $this->findRowMatch($newMatchData, $startInOld, $endInOld, $startInNew, $endInNew);
-        if ($match !== null) {
-            if ($startInOld < $match->getStartInOld() &&
-                $startInNew < $match->getStartInNew()
-            ) {
-                $this->findRowMatches(
-                    $newMatchData,
-                    $startInOld,
-                    $match->getStartInOld(),
-                    $startInNew,
-                    $match->getStartInNew(),
-                    $matches
-                );
-            }
-
-            $matches[] = $match;
-
-            if ($match->getEndInOld() < $endInOld &&
-                $match->getEndInNew() < $endInNew
-            ) {
-                $this->findRowMatches(
-                    $newMatchData,
-                    $match->getEndInOld(),
-                    $endInOld,
-                    $match->getEndInNew(),
-                    $endInNew,
-                    $matches
-                );
-            }
-        }
-    }
-
-    /**
-     * @param array $newMatchData
-     * @param int   $startInOld
-     * @param int   $endInOld
-     * @param int   $startInNew
-     * @param int   $endInNew
-     *
-     * @return RowMatch|null
-     */
-    protected function findRowMatch($newMatchData, $startInOld, $endInOld, $startInNew, $endInNew)
-    {
-        $bestMatch = null;
-        $bestPercentage = 0;
-
-        foreach ($newMatchData as $newIndex => $oldMatches) {
-            if ($newIndex < $startInNew) {
-                continue;
-            }
-
-            if ($newIndex >= $endInNew) {
-                break;
-            }
-            foreach ($oldMatches as $oldIndex => $percentage) {
-                if ($oldIndex < $startInOld) {
-                    continue;
-                }
-
-                if ($oldIndex >= $endInOld) {
-                    break;
-                }
-
-                if ($percentage > $bestPercentage) {
-                    $bestPercentage = $percentage;
-                    $bestMatch = array(
-                        'oldIndex' => $oldIndex,
-                        'newIndex' => $newIndex,
-                        'percentage' => $percentage,
-                    );
-                }
-            }
+        // Determine section from the source rows
+        $section = '';
+        if ($newRow) {
+            $section = $newRow->getSection();
+        } elseif ($oldRow) {
+            $section = $oldRow->getSection();
         }
 
-        if ($bestMatch !== null) {
-            return new RowMatch(
-                $bestMatch['newIndex'],
-                $bestMatch['oldIndex'],
-                $bestMatch['newIndex'] + 1,
-                $bestMatch['oldIndex'] + 1,
-                $bestMatch['percentage']
-            );
-        }
-
-        return;
-    }
-
-    /**
-     * @param TableRow|null $oldRow
-     * @param TableRow|null $newRow
-     * @param array         $appliedRowSpans
-     * @param bool          $forceExpansion
-     *
-     * @return array
-     */
-    protected function diffRows($oldRow, $newRow, array &$appliedRowSpans, $forceExpansion = false)
-    {
-        // create tr dom element
-        $rowToClone = $newRow ?: $oldRow;
-        /* @var $diffRow \DOMElement */
-        $diffRow = $this->diffDom->importNode($rowToClone->getDomNode()->cloneNode(false), false);
-
-        $oldCells = $oldRow ? $oldRow->getCells() : array();
-        $newCells = $newRow ? $newRow->getCells() : array();
-
-        $position = new DiffRowPosition();
-
-        $extraRow = null;
-
-        /* @var $expandCells \DOMElement[] */
-        $expandCells = array();
-        /* @var $cellsWithMultipleRows \DOMElement[] */
-        $cellsWithMultipleRows = array();
-
-        $newCellCount = count($newCells);
-        while ($position->getIndexInNew() < $newCellCount) {
-            if (!$position->areColumnsEqual()) {
-                $type = $position->getLesserColumnType();
-                if ($type === 'new') {
-                    $row = $newRow;
-                    $targetRow = $extraRow;
-                } else {
-                    $row = $oldRow;
-                    $targetRow = $diffRow;
-                }
-                if ($row && $targetRow && (!$type === 'old' || isset($oldCells[$position->getIndexInOld()]))) {
-                    $this->syncVirtualColumns($row, $position, $cellsWithMultipleRows, $targetRow, $type, true);
-
-                    continue;
-                }
-            }
-
-            /* @var $newCell TableCell */
-            $newCell = $newCells[$position->getIndexInNew()];
-            /* @var $oldCell TableCell */
-            $oldCell = isset($oldCells[$position->getIndexInOld()]) ? $oldCells[$position->getIndexInOld()] : null;
-
-            if ($oldCell && $newCell->getColspan() != $oldCell->getColspan()) {
-                if (null === $extraRow) {
-                    /* @var $extraRow \DOMElement */
-                    $extraRow = $this->diffDom->importNode($rowToClone->getDomNode()->cloneNode(false), false);
-                }
-
-                if ($oldCell->getColspan() > $newCell->getColspan()) {
-                    $this->diffCellsAndIncrementCounters(
-                        $oldCell,
-                        null,
-                        $cellsWithMultipleRows,
-                        $diffRow,
-                        $position,
-                        true
-                    );
-                    $this->syncVirtualColumns($newRow, $position, $cellsWithMultipleRows, $extraRow, 'new', true);
-                } else {
-                    $this->diffCellsAndIncrementCounters(
-                        null,
-                        $newCell,
-                        $cellsWithMultipleRows,
-                        $extraRow,
-                        $position,
-                        true
-                    );
-                    $this->syncVirtualColumns($oldRow, $position, $cellsWithMultipleRows, $diffRow, 'old', true);
-                }
-            } else {
-                $diffCell = $this->diffCellsAndIncrementCounters(
-                    $oldCell,
-                    $newCell,
-                    $cellsWithMultipleRows,
-                    $diffRow,
-                    $position
-                );
-                $expandCells[] = $diffCell;
-            }
-        }
-
-        $oldCellCount = count($oldCells);
-        while ($position->getIndexInOld() < $oldCellCount) {
-            $diffCell = $this->diffCellsAndIncrementCounters(
-                $oldCells[$position->getIndexInOld()],
-                null,
-                $cellsWithMultipleRows,
-                $diffRow,
-                $position
-            );
-            $expandCells[] = $diffCell;
-        }
-
+        $this->pendingDiffRows[] = ['node' => $rowDom, 'section' => $section];
         if ($extraRow) {
-            foreach ($expandCells as $expandCell) {
-                $rowspan = $expandCell->getAttribute('rowspan') ?: 1;
-                $expandCell->setAttribute('rowspan', 1 + $rowspan);
-            }
+            $this->pendingDiffRows[] = ['node' => $extraRow, 'section' => $section];
         }
-
-        if ($extraRow || $forceExpansion) {
-            foreach ($appliedRowSpans as $rowSpanCells) {
-                /* @var $rowSpanCells \DOMElement[] */
-                foreach ($rowSpanCells as $extendCell) {
-                    $rowspan = $extendCell->getAttribute('rowspan') ?: 1;
-                    $extendCell->setAttribute('rowspan', 1 + $rowspan);
-                }
-            }
-        }
-
-        if (!$forceExpansion) {
-            array_shift($appliedRowSpans);
-            $appliedRowSpans = array_values($appliedRowSpans);
-        }
-        $appliedRowSpans = array_merge($appliedRowSpans, array_values($cellsWithMultipleRows));
-
-        return array($diffRow, $extraRow);
     }
 
-    /**
-     * @param TableCell|null $oldCell
-     * @param TableCell|null $newCell
-     *
-     * @return \DOMElement
-     */
-    protected function getNewCellNode(?TableCell $oldCell = null, ?TableCell $newCell = null)
-    {
-        // If only one cell exists, use it
-        if (!$oldCell || !$newCell) {
-            $clone = $newCell
-                ? $newCell->getDomNode()->cloneNode(false)
-                : $oldCell->getDomNode()->cloneNode(false);
-        } else {
-            $oldNode = $oldCell->getDomNode();
-            $newNode = $newCell->getDomNode();
-
-            /* @var $clone \DOMElement */
-            $clone = $newNode->cloneNode(false);
-
-            $oldRowspan = $oldNode->getAttribute('rowspan') ?: 1;
-            $oldColspan = $oldNode->getAttribute('colspan') ?: 1;
-            $newRowspan = $newNode->getAttribute('rowspan') ?: 1;
-            $newColspan = $newNode->getAttribute('colspan') ?: 1;
-
-            $clone->setAttribute('rowspan', max($oldRowspan, $newRowspan));
-            $clone->setAttribute('colspan', max($oldColspan, $newColspan));
-        }
-
-        return $this->diffDom->importNode($clone);
-    }
+    // ========== Cell diffing ==========
 
     /**
-     * @param TableCell|null $oldCell
-     * @param TableCell|null $newCell
-     * @param bool           $usingExtraRow
-     *
-     * @return \DOMElement
+     * REWRITTEN: Short-circuits identical cells completely.
      */
     protected function diffCells($oldCell, $newCell, $usingExtraRow = false)
     {
@@ -589,29 +481,116 @@ class TableDiff extends AbstractDiff
         $oldContent = $oldCell ? $this->getInnerHtml($oldCell->getDomNode()) : '';
         $newContent = $newCell ? $this->getInnerHtml($newCell->getDomNode()) : '';
 
-        $htmlDiff = HtmlDiff::create(
-            mb_convert_encoding($oldContent, 'UTF-8', 'HTML-ENTITIES'),
-            mb_convert_encoding($newContent, 'UTF-8', 'HTML-ENTITIES'),
-            $this->config
-        );
-        $diff = $htmlDiff->build();
+        // SHORT CIRCUIT: identical content, both cells exist
+        if ($oldContent === $newContent && $oldCell !== null && $newCell !== null) {
+            $diff = $newContent;
+        } else {
+            $diff = HtmlDiff::create(
+                mb_convert_encoding($oldContent, 'UTF-8', 'HTML-ENTITIES'),
+                mb_convert_encoding($newContent, 'UTF-8', 'HTML-ENTITIES'),
+                $this->config
+            )->build();
+        }
 
         $this->setInnerHtml($diffCell, $diff);
 
-        if (null === $newCell) {
-            $diffCell->setAttribute('class', trim($diffCell->getAttribute('class').' del'));
-        }
-
-        if (null === $oldCell) {
-            $diffCell->setAttribute('class', trim($diffCell->getAttribute('class').' ins'));
-        }
-
-        if ($usingExtraRow) {
-            $diffCell->setAttribute('class', trim($diffCell->getAttribute('class').' extra-row'));
-        }
+        if (null === $newCell) $diffCell->setAttribute('class', trim($diffCell->getAttribute('class') . ' del'));
+        if (null === $oldCell) $diffCell->setAttribute('class', trim($diffCell->getAttribute('class') . ' ins'));
+        if ($usingExtraRow) $diffCell->setAttribute('class', trim($diffCell->getAttribute('class') . ' extra-row'));
 
         return $diffCell;
     }
+
+    // ========== Row diffing (column alignment logic) ==========
+
+    protected function diffRows($oldRow, $newRow, array &$appliedRowSpans, $forceExpansion = false)
+    {
+        $rowToClone = $newRow ?: $oldRow;
+        $diffRow = $this->diffDom->importNode($rowToClone->getDomNode()->cloneNode(false), false);
+        $oldCells = $oldRow ? $oldRow->getCells() : [];
+        $newCells = $newRow ? $newRow->getCells() : [];
+        $position = new DiffRowPosition();
+        $extraRow = null;
+        $expandCells = [];
+        $cellsWithMultipleRows = [];
+
+        $newCellCount = count($newCells);
+        while ($position->getIndexInNew() < $newCellCount) {
+            if (!$position->areColumnsEqual()) {
+                $type = $position->getLesserColumnType();
+                $row = ($type === 'new') ? $newRow : $oldRow;
+                $targetRow = ($type === 'new') ? $extraRow : $diffRow;
+                if ($row && $targetRow && (!$type === 'old' || isset($oldCells[$position->getIndexInOld()]))) {
+                    $this->syncVirtualColumns($row, $position, $cellsWithMultipleRows, $targetRow, $type, true);
+                    continue;
+                }
+            }
+
+            $newCell = $newCells[$position->getIndexInNew()];
+            $oldCell = isset($oldCells[$position->getIndexInOld()]) ? $oldCells[$position->getIndexInOld()] : null;
+
+            if ($oldCell && $newCell->getColspan() != $oldCell->getColspan()) {
+                if (null === $extraRow) $extraRow = $this->diffDom->importNode($rowToClone->getDomNode()->cloneNode(false), false);
+                if ($oldCell->getColspan() > $newCell->getColspan()) {
+                    $this->diffCellsAndIncrementCounters($oldCell, null, $cellsWithMultipleRows, $diffRow, $position, true);
+                    $this->syncVirtualColumns($newRow, $position, $cellsWithMultipleRows, $extraRow, 'new', true);
+                } else {
+                    $this->diffCellsAndIncrementCounters(null, $newCell, $cellsWithMultipleRows, $extraRow, $position, true);
+                    $this->syncVirtualColumns($oldRow, $position, $cellsWithMultipleRows, $diffRow, 'old', true);
+                }
+            } else {
+                $expandCells[] = $this->diffCellsAndIncrementCounters($oldCell, $newCell, $cellsWithMultipleRows, $diffRow, $position);
+            }
+        }
+
+        $oldCellCount = count($oldCells);
+        while ($position->getIndexInOld() < $oldCellCount) {
+            $expandCells[] = $this->diffCellsAndIncrementCounters($oldCells[$position->getIndexInOld()], null, $cellsWithMultipleRows, $diffRow, $position);
+        }
+
+        if ($extraRow) { foreach ($expandCells as $c) { $c->setAttribute('rowspan', 1 + ($c->getAttribute('rowspan') ?: 1)); } }
+        if ($extraRow || $forceExpansion) { foreach ($appliedRowSpans as $cells) { foreach ($cells as $c) { $c->setAttribute('rowspan', 1 + ($c->getAttribute('rowspan') ?: 1)); } } }
+        if (!$forceExpansion) { array_shift($appliedRowSpans); $appliedRowSpans = array_values($appliedRowSpans); }
+        $appliedRowSpans = array_merge($appliedRowSpans, array_values($cellsWithMultipleRows));
+
+        return [$diffRow, $extraRow];
+    }
+
+    protected function syncVirtualColumns($tableRow, DiffRowPosition $position, &$cellsWithMultipleRows, $diffRow, $diffType, $usingExtraRow = false)
+    {
+        $currentCell = $tableRow->getCell($position->getIndex($diffType));
+        while ($position->isColumnLessThanOther($diffType) && $currentCell) {
+            $diffCell = $diffType === 'new' ? $this->diffCells(null, $currentCell, $usingExtraRow) : $this->diffCells($currentCell, null, $usingExtraRow);
+            if ($diffCell->getAttribute('rowspan') > 1) $cellsWithMultipleRows[$diffCell->getAttribute('rowspan')][] = $diffCell;
+            $diffRow->appendChild($diffCell);
+            $position->incrementColumn($diffType, $currentCell->getColspan());
+            $currentCell = $tableRow->getCell($position->incrementIndex($diffType));
+        }
+    }
+
+    protected function diffCellsAndIncrementCounters($oldCell, $newCell, &$cellsWithMultipleRows, $diffRow, DiffRowPosition $position, $usingExtraRow = false)
+    {
+        $diffCell = $this->diffCells($oldCell, $newCell, $usingExtraRow);
+        if ($diffCell->getAttribute('rowspan') > 1) $cellsWithMultipleRows[$diffCell->getAttribute('rowspan')][] = $diffCell;
+        $diffRow->appendChild($diffCell);
+        if ($newCell !== null) { $position->incrementIndexInNew(); $position->incrementColumnInNew($newCell->getColspan()); }
+        if ($oldCell !== null) { $position->incrementIndexInOld(); $position->incrementColumnInOld($oldCell->getColspan()); }
+        return $diffCell;
+    }
+
+    protected function getNewCellNode(?TableCell $oldCell = null, ?TableCell $newCell = null)
+    {
+        if (!$oldCell || !$newCell) {
+            $clone = ($newCell ?: $oldCell)->getDomNode()->cloneNode(false);
+        } else {
+            $clone = $newCell->getDomNode()->cloneNode(false);
+            $clone->setAttribute('rowspan', max($oldCell->getDomNode()->getAttribute('rowspan') ?: 1, $newCell->getDomNode()->getAttribute('rowspan') ?: 1));
+            $clone->setAttribute('colspan', max($oldCell->getDomNode()->getAttribute('colspan') ?: 1, $newCell->getDomNode()->getAttribute('colspan') ?: 1));
+        }
+        return $this->diffDom->importNode($clone);
+    }
+
+    // ========== DOM utilities ==========
 
     protected function buildTableDoms()
     {
@@ -619,273 +598,78 @@ class TableDiff extends AbstractDiff
         $this->newTable = $this->parseTableStructure($this->newText);
     }
 
-    /**
-     * @param string $text
-     *
-     * @return \DOMDocument
-     */
     protected function createDocumentWithHtml($text)
     {
         $dom = new \DOMDocument();
         $dom->loadHTML(htmlspecialchars_decode(iconv('UTF-8', 'ISO-8859-1//IGNORE', htmlentities($text, ENT_COMPAT, 'UTF-8')), ENT_QUOTES));
-
         return $dom;
     }
 
-    /**
-     * @param string $text
-     *
-     * @return Table
-     */
     protected function parseTableStructure($text)
     {
         $dom = $this->createDocumentWithHtml($text);
-
-        $tableNode = $dom->getElementsByTagName('table')->item(0);
-
-        $table = new Table($tableNode);
-
+        $table = new Table($dom->getElementsByTagName('table')->item(0));
         $this->parseTable($table);
-
         return $table;
     }
 
-    /**
-     * @param Table         $table
-     * @param \DOMNode|null $node
-     */
-    protected function parseTable(Table $table, ?\DOMNode $node = null)
+    protected function parseTable(Table $table, ?\DOMNode $node = null, string $currentSection = '')
     {
-        if ($node === null) {
-            $node = $table->getDomNode();
-        }
-
-        if (!$node->childNodes) {
-            return;
-        }
-
+        $node = $node ?? $table->getDomNode();
+        if (!$node->childNodes) return;
         foreach ($node->childNodes as $child) {
             if ($child->nodeName === 'tr') {
                 $row = new TableRow($child);
+                $row->setSection($currentSection);
                 $table->addRow($row);
-
                 $this->parseTableRow($row);
+            } elseif (in_array($child->nodeName, ['thead', 'tbody', 'tfoot'])) {
+                $this->parseTable($table, $child, $child->nodeName);
             } else {
-                $this->parseTable($table, $child);
+                $this->parseTable($table, $child, $currentSection);
             }
         }
     }
 
-    /**
-     * @param TableRow $row
-     */
     protected function parseTableRow(TableRow $row)
     {
-        $node = $row->getDomNode();
-
-        foreach ($node->childNodes as $child) {
-            if (in_array($child->nodeName, array('td', 'th'))) {
-                $cell = new TableCell($child);
-                $row->addCell($cell);
-            }
+        foreach ($row->getDomNode()->childNodes as $child) {
+            if (in_array($child->nodeName, ['td', 'th'])) $row->addCell(new TableCell($child));
         }
     }
 
-    /**
-     * @param \DOMNode $node
-     *
-     * @return string
-     */
     protected function getInnerHtml($node)
     {
-        $innerHtml = '';
-        $children = $node->childNodes;
-
-        foreach ($children as $child) {
-            $innerHtml .= $this->htmlFromNode($child);
-        }
-
-        return $innerHtml;
+        $html = '';
+        foreach ($node->childNodes as $child) $html .= $this->htmlFromNode($child);
+        return $html;
     }
 
-    /**
-     * @param \DOMNode $node
-     *
-     * @return string
-     */
     protected function htmlFromNode($node)
     {
-        $domDocument = new \DOMDocument();
-        $newNode = $domDocument->importNode($node, true);
-        $domDocument->appendChild($newNode);
-
-        return $domDocument->saveHTML();
+        $doc = new \DOMDocument();
+        $doc->appendChild($doc->importNode($node, true));
+        return $doc->saveHTML();
     }
 
-    /**
-     * @param \DOMNode $node
-     * @param string   $html
-     */
     protected function setInnerHtml($node, $html)
     {
-        // DOMDocument::loadHTML does not allow empty strings.
-        if ($this->stringUtil->strlen(trim($html)) === 0) {
-            $html = '<span class="empty"></span>';
-        }
-
+        if (strlen(trim($html)) === 0) $html = '<span class="empty"></span>';
         $doc = $this->createDocumentWithHtml($html);
         $fragment = $node->ownerDocument->createDocumentFragment();
-        $root = $doc->getElementsByTagName('body')->item(0);
-        foreach ($root->childNodes as $child) {
+        foreach ($doc->getElementsByTagName('body')->item(0)->childNodes as $child) {
             $fragment->appendChild($node->ownerDocument->importNode($child, true));
         }
-
         $node->appendChild($fragment);
     }
 
-    /**
-     * @param Table $table
-     */
     protected function indexCellValues(Table $table)
     {
-        foreach ($table->getRows() as $rowIndex => $row) {
-            foreach ($row->getCells() as $cellIndex => $cell) {
-                $value = trim($cell->getDomNode()->textContent);
-
-                if (!isset($this->cellValues[$value])) {
-                    $this->cellValues[$value] = array();
-                }
-
-                $this->cellValues[$value][] = new TablePosition($rowIndex, $cellIndex);
+        foreach ($table->getRows() as $ri => $row) {
+            foreach ($row->getCells() as $ci => $cell) {
+                $v = trim($cell->getDomNode()->textContent);
+                $this->cellValues[$v][] = new TablePosition($ri, $ci);
             }
         }
-    }
-
-    /**
-     * @param TableRow        $tableRow
-     * @param DiffRowPosition $position
-     * @param array           $cellsWithMultipleRows
-     * @param \DOMNode        $diffRow
-     * @param string          $diffType
-     * @param bool            $usingExtraRow
-     */
-    protected function syncVirtualColumns(
-        $tableRow,
-        DiffRowPosition $position,
-        &$cellsWithMultipleRows,
-        $diffRow,
-        $diffType,
-        $usingExtraRow = false
-    ) {
-        $currentCell = $tableRow->getCell($position->getIndex($diffType));
-        while ($position->isColumnLessThanOther($diffType) && $currentCell) {
-            $diffCell = $diffType === 'new' ? $this->diffCells(null, $currentCell, $usingExtraRow) : $this->diffCells(
-                $currentCell,
-                null,
-                $usingExtraRow
-            );
-            // Store cell in appliedRowSpans if spans multiple rows
-            if ($diffCell->getAttribute('rowspan') > 1) {
-                $cellsWithMultipleRows[$diffCell->getAttribute('rowspan')][] = $diffCell;
-            }
-            $diffRow->appendChild($diffCell);
-            $position->incrementColumn($diffType, $currentCell->getColspan());
-            $currentCell = $tableRow->getCell($position->incrementIndex($diffType));
-        }
-    }
-
-    /**
-     * @param null|TableCell  $oldCell
-     * @param null|TableCell  $newCell
-     * @param array           $cellsWithMultipleRows
-     * @param \DOMElement     $diffRow
-     * @param DiffRowPosition $position
-     * @param bool            $usingExtraRow
-     *
-     * @return \DOMElement
-     */
-    protected function diffCellsAndIncrementCounters(
-        $oldCell,
-        $newCell,
-        &$cellsWithMultipleRows,
-        $diffRow,
-        DiffRowPosition $position,
-        $usingExtraRow = false
-    ) {
-        $diffCell = $this->diffCells($oldCell, $newCell, $usingExtraRow);
-        // Store cell in appliedRowSpans if spans multiple rows
-        if ($diffCell->getAttribute('rowspan') > 1) {
-            $cellsWithMultipleRows[$diffCell->getAttribute('rowspan')][] = $diffCell;
-        }
-        $diffRow->appendChild($diffCell);
-
-        if ($newCell !== null) {
-            $position->incrementIndexInNew();
-            $position->incrementColumnInNew($newCell->getColspan());
-        }
-
-        if ($oldCell !== null) {
-            $position->incrementIndexInOld();
-            $position->incrementColumnInOld($oldCell->getColspan());
-        }
-
-        return $diffCell;
-    }
-
-    /**
-     * @param TableRow|null $oldRow
-     * @param TableRow|null $newRow
-     * @param array         $appliedRowSpans
-     * @param bool          $forceExpansion
-     */
-    protected function diffAndAppendRows($oldRow, $newRow, &$appliedRowSpans, $forceExpansion = false)
-    {
-        list($rowDom, $extraRow) = $this->diffRows(
-            $oldRow,
-            $newRow,
-            $appliedRowSpans,
-            $forceExpansion
-        );
-
-        $this->diffTable->appendChild($rowDom);
-
-        if ($extraRow) {
-            $this->diffTable->appendChild($extraRow);
-        }
-    }
-
-    /**
-     * @param TableRow $oldRow
-     * @param TableRow $newRow
-     * @param int      $oldIndex
-     * @param int      $newIndex
-     *
-     * @return float|int
-     */
-    protected function getMatchPercentage(TableRow $oldRow, TableRow $newRow, $oldIndex, $newIndex)
-    {
-        $firstCellWeight = 1.5;
-        $indexDeltaWeight = 0.25 * (abs($oldIndex - $newIndex));
-        $thresholdCount = 0;
-        $minCells = min(count($newRow->getCells()), count($oldRow->getCells()));
-        $totalCount = ($minCells + $firstCellWeight + $indexDeltaWeight) * 100;
-        foreach ($newRow->getCells() as $newIndex => $newCell) {
-            $oldCell = $oldRow->getCell($newIndex);
-
-            if ($oldCell) {
-                $percentage = null;
-                similar_text($oldCell->getInnerHtml(), $newCell->getInnerHtml(), $percentage);
-
-                if ($percentage > ($this->config->getMatchThreshold() * 0.50)) {
-                    $increment = $percentage;
-                    if ($newIndex === 0 && $percentage > 95) {
-                        $increment = $increment * $firstCellWeight;
-                    }
-                    $thresholdCount += $increment;
-                }
-            }
-        }
-
-        return ($totalCount > 0) ? ($thresholdCount / $totalCount) : 0;
     }
 }

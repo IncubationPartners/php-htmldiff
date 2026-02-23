@@ -18,6 +18,11 @@ class TableRow extends AbstractTableElement
     protected $cells = array();
 
     /**
+     * @var string Section type: 'thead', 'tbody', 'tfoot', or '' for direct children
+     */
+    protected $section = '';
+
+    /**
      * @return Table
      */
     public function getTable()
@@ -101,5 +106,23 @@ class TableRow extends AbstractTableElement
         } else {
             array_splice($this->cells, $position, 0, $cells);
         }
+    }
+
+    /**
+     * @return string
+     */
+    public function getSection()
+    {
+        return $this->section;
+    }
+
+    /**
+     * @param string $section
+     * @return $this
+     */
+    public function setSection($section)
+    {
+        $this->section = $section;
+        return $this;
     }
 }
